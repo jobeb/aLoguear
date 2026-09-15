@@ -7,17 +7,32 @@ import datetime
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import tkinter as tk
 import urllib.error
 import urllib.request
 import webbrowser
-from tkinter import messagebox, ttk
+import zipfile
+from tkinter import filedialog, messagebox, ttk
 
 import config_store
 from version import __version__ as APP_VERSION, GITHUB_REPO
+
+try:
+    import pystray
+    from PIL import Image as PILImage
+except Exception:
+    pystray = None
+    PILImage = None
+
+try:
+    from win11toast import toast as _tray_toast
+except Exception:
+    _tray_toast = None
 
 _NET_DATE_RE = re.compile(r"/Date\((\d+)\)/")
 
@@ -28,10 +43,12 @@ def _parse_version(text: str) -> tuple:
     return tuple(int(p) for p in parts) or (0,)
 
 
-def check_for_update() -> tuple[str, str] | None:
-    """Consulta el último release de GitHub. Devuelve (version, url) si hay
-    una versión más nueva que la instalada, o None (sin release, sin
-    conexión, o ya estamos al día). No debe lanzar excepciones nunca."""
+def check_for_update() -> tuple[str, str, str | None] | None:
+    """Consulta el último release de GitHub. Devuelve (version, html_url,
+    asset_zip_url) si hay una versión más nueva que la instalada, o None (sin
+    release, sin conexión, o ya estamos al día). asset_zip_url puede ser None
+    si el release no trae un .zip portable adjunto. No debe lanzar excepciones
+    nunca."""
     try:
         req = urllib.request.Request(
             f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
@@ -44,7 +61,12 @@ def check_for_update() -> tuple[str, str] | None:
             return None
         if _parse_version(latest_tag) > _parse_version(APP_VERSION):
             html_url = data.get("html_url") or f"https://github.com/{GITHUB_REPO}/releases/latest"
-            return latest_tag, html_url
+            asset_url = None
+            for asset in data.get("assets", []):
+                if asset.get("name", "").endswith("-win64.zip"):
+                    asset_url = asset.get("browser_download_url")
+                    break
+            return latest_tag, html_url, asset_url
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError, OSError):
         pass
     return None
@@ -73,6 +95,48 @@ ACCENT_LIGHT = "#eef0ff"
 SUCCESS = "#0f7d3c"
 DANGER = "#b3261e"
 DANGER_LIGHT = "#fdecea"
+
+
+_EXPORT_FIELDS = [
+    "name", "url", "username", "headless", "user_selector", "pass_selector",
+    "submit_selector", "schedule_time", "schedule_days", "keep_alive",
+    "keep_alive_interval_min", "keep_alive_duration_min", "active",
+]
+
+# Espera a que este proceso (aLoguear.exe) termine, copia los archivos nuevos
+# encima de los actuales (reintentando mientras el .exe siga bloqueado) y
+# vuelve a abrir la app. Se lanza desprendido justo antes de cerrar la app.
+_UPDATE_BAT_TEMPLATE = """@echo off
+setlocal
+
+:waitloop
+tasklist /FI "PID eq {pid}" 2>nul | find "{pid}" >nul
+if not errorlevel 1 (
+    timeout /t 1 /nobreak >nul
+    goto waitloop
+)
+
+set RETRIES=0
+:copyloop
+copy /y "{src}\\aLoguear.exe" "{dest}\\aLoguear.exe" >nul 2>&1
+if errorlevel 1 (
+    set /a RETRIES+=1
+    if %RETRIES% GEQ 15 goto giveup
+    timeout /t 1 /nobreak >nul
+    goto copyloop
+)
+
+copy /y "{src}\\aLoguear-runner.exe" "{dest}\\aLoguear-runner.exe" >nul 2>&1
+copy /y "{src}\\register_task.ps1" "{dest}\\register_task.ps1" >nul 2>&1
+copy /y "{src}\\unregister_task.ps1" "{dest}\\unregister_task.ps1" >nul 2>&1
+copy /y "{src}\\list_next_runs.ps1" "{dest}\\list_next_runs.ps1" >nul 2>&1
+
+start "" "{dest}\\aLoguear.exe"
+goto :eof
+
+:giveup
+start "" "{dest}\\aLoguear.exe"
+"""
 
 
 def _days_display(day_names: list) -> str:
@@ -209,9 +273,12 @@ class App(tk.Tk):
         self.configure(bg=BG)
 
         self.current_task_id = None
+        self.tray_icon = None
+        self._tray_hint_shown = False
 
         self._setup_style()
         self._set_app_icon()
+        self.protocol("WM_DELETE_WINDOW", self._on_close_button)
 
         # --- Cabecera ---
         header = ttk.Frame(self, style="Header.TFrame")
@@ -229,10 +296,16 @@ class App(tk.Tk):
         # --- Aviso de actualización disponible (oculto hasta comprobarlo) ---
         self.update_banner = ttk.Frame(self, style="UpdateBanner.TFrame")
         self._update_url = None
+        self._update_asset_url = None
         self.update_label = ttk.Label(self.update_banner, text="", style="UpdateBanner.TLabel")
         self.update_label.pack(side="left", padx=(16, 8), pady=6)
-        ttk.Button(
-            self.update_banner, text="Ver novedades", style="UpdateBanner.TButton",
+        self.update_now_btn = ttk.Button(
+            self.update_banner, text="⬇  Actualizar ahora", style="UpdateBanner.TButton",
+            command=self._start_update_download,
+        )
+        self.update_now_btn.pack(side="left", padx=(0, 6))
+        self.update_link_btn = ttk.Button(
+            self.update_banner, text="Ver novedades", style="UpdateBannerLink.TButton",
             command=lambda: webbrowser.open(self._update_url) if self._update_url else None,
         ).pack(side="left")
         self.after(800, self._start_update_check)
@@ -278,10 +351,25 @@ class App(tk.Tk):
         add_row = ttk.Frame(list_card, style="Card.TFrame")
         add_row.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         add_row.grid_columnconfigure(0, weight=1)
-        add_btn = ttk.Button(
-            add_row, text="➕  Añadir tarea", style="AccentSmall.TButton", command=self.on_new_task
+        list_btns = ttk.Frame(add_row, style="Card.TFrame")
+        list_btns.grid(row=0, column=0, sticky="e")
+
+        export_btn = ttk.Button(
+            list_btns, text="⬆", style="IconGhost.TButton", width=3, command=self.on_export_tasks
         )
-        add_btn.grid(row=0, column=0, sticky="e")
+        export_btn.pack(side="left", padx=(0, 6))
+        ToolTip(export_btn, "Exportar todas las tareas a un archivo (para respaldo o mover a otro equipo).")
+
+        import_btn = ttk.Button(
+            list_btns, text="⬇", style="IconGhost.TButton", width=3, command=self.on_import_tasks
+        )
+        import_btn.pack(side="left", padx=(0, 6))
+        ToolTip(import_btn, "Importar tareas desde un archivo exportado antes.")
+
+        add_btn = ttk.Button(
+            list_btns, text="➕  Añadir tarea", style="AccentSmall.TButton", command=self.on_new_task
+        )
+        add_btn.pack(side="left")
         ToolTip(add_btn, "Limpia el formulario para crear una tarea nueva desde cero.")
 
         self.tree = ttk.Treeview(
@@ -569,6 +657,60 @@ class App(tk.Tk):
         except tk.TclError:
             pass
 
+    # --- Bandeja del sistema ---
+
+    def _on_close_button(self):
+        if pystray is not None:
+            self._minimize_to_tray()
+        else:
+            self.destroy()
+
+    def _minimize_to_tray(self):
+        self.withdraw()
+        if not self._tray_hint_shown:
+            self._tray_hint_shown = True
+            if _tray_toast is not None:
+                try:
+                    _tray_toast(
+                        APP_NAME,
+                        "Sigue ejecutándose en la bandeja del sistema. Clic derecho en su "
+                        "icono para abrirla de nuevo o salir del todo.",
+                        duration="short",
+                    )
+                except Exception:
+                    pass
+        if self.tray_icon is None:
+            self._start_tray_icon()
+
+    def _start_tray_icon(self):
+        icon_path = os.path.join(ASSETS_DIR, "icon.png")
+        try:
+            image = PILImage.open(icon_path) if os.path.exists(icon_path) else PILImage.new(
+                "RGBA", (64, 64), (79, 70, 229, 255)
+            )
+        except Exception:
+            image = PILImage.new("RGBA", (64, 64), (79, 70, 229, 255))
+        menu = pystray.Menu(
+            pystray.MenuItem("Abrir aLoguear", self._tray_open, default=True),
+            pystray.MenuItem("Salir", self._tray_quit),
+        )
+        self.tray_icon = pystray.Icon(APP_NAME, image, APP_NAME, menu)
+        threading.Thread(target=self.tray_icon.run, daemon=True).start()
+
+    def _tray_open(self, icon=None, item=None):
+        self.after(0, self._restore_from_tray)
+
+    def _restore_from_tray(self):
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+
+    def _tray_quit(self, icon=None, item=None):
+        if self.tray_icon is not None:
+            self.tray_icon.stop()
+            self.tray_icon = None
+        self.after(0, self.destroy)
+
     # --- Actualizaciones ---
 
     def _start_update_check(self):
@@ -579,10 +721,74 @@ class App(tk.Tk):
         if result:
             self.after(0, lambda: self._show_update_banner(*result))
 
-    def _show_update_banner(self, latest_version: str, url: str):
+    def _show_update_banner(self, latest_version: str, url: str, asset_url: str | None):
         self._update_url = url
+        self._update_asset_url = asset_url
         self.update_label.configure(text=f"🔔  Hay una nueva versión disponible: {latest_version} (tienes {APP_VERSION})")
+        can_self_update = getattr(sys, "frozen", False) and asset_url
+        if can_self_update:
+            self.update_now_btn.pack(side="left", padx=(0, 6), before=self.update_link_btn)
+        else:
+            self.update_now_btn.pack_forget()
         self.update_banner.pack(fill="x", before=self.scroll_container)
+
+    def _start_update_download(self):
+        if not self._update_asset_url:
+            return
+        self.update_now_btn.configure(state="disabled", text="Descargando...")
+        threading.Thread(target=self._download_and_apply_update, daemon=True).start()
+
+    def _download_and_apply_update(self):
+        try:
+            tmp_dir = tempfile.mkdtemp(prefix="aloguear_update_")
+            zip_path = os.path.join(tmp_dir, "update.zip")
+            req = urllib.request.Request(
+                self._update_asset_url, headers={"User-Agent": "aLoguear-updater"}
+            )
+            with urllib.request.urlopen(req, timeout=120) as resp, open(zip_path, "wb") as f:
+                shutil.copyfileobj(resp, f)
+
+            extract_dir = os.path.join(tmp_dir, "extracted")
+            with zipfile.ZipFile(zip_path) as zf:
+                zf.extractall(extract_dir)
+            if not os.path.exists(os.path.join(extract_dir, "aLoguear.exe")):
+                for name in os.listdir(extract_dir):
+                    sub = os.path.join(extract_dir, name)
+                    if os.path.isdir(sub) and os.path.exists(os.path.join(sub, "aLoguear.exe")):
+                        extract_dir = sub
+                        break
+                else:
+                    raise RuntimeError("El .zip descargado no contiene aLoguear.exe")
+
+            install_dir = os.path.dirname(sys.executable)
+            bat_path = os.path.join(tmp_dir, "update.bat")
+            with open(bat_path, "w", encoding="mbcs") as f:
+                f.write(_UPDATE_BAT_TEMPLATE.format(
+                    pid=os.getpid(), src=extract_dir, dest=install_dir,
+                ))
+            subprocess.Popen(
+                ["cmd.exe", "/c", bat_path],
+                creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
+            )
+            self.after(0, self._quit_for_update)
+        except Exception as exc:
+            self.after(0, lambda: self._update_download_failed(str(exc)))
+
+    def _quit_for_update(self):
+        if self.tray_icon is not None:
+            try:
+                self.tray_icon.stop()
+            except Exception:
+                pass
+        self.destroy()
+
+    def _update_download_failed(self, message: str):
+        self.update_now_btn.configure(state="normal", text="⬇  Actualizar ahora")
+        messagebox.showerror(
+            "Error al actualizar",
+            f"No se pudo descargar/aplicar la actualización automáticamente:\n{message}\n\n"
+            "Puedes descargarla a mano desde 'Ver novedades'.",
+        )
 
     # --- Estilo ---
 
@@ -607,6 +813,12 @@ class App(tk.Tk):
             background="#8a6100", foreground="white", borderwidth=0, relief="flat"
         )
         style.map("UpdateBanner.TButton", background=[("active", "#6b4b00")])
+        style.configure(
+            "UpdateBannerLink.TButton", font=(FONT, 8), padding=(6, 3),
+            background="#fff7e0", foreground="#8a6100", borderwidth=1,
+            relief="solid", bordercolor="#e0c26a"
+        )
+        style.map("UpdateBannerLink.TButton", background=[("active", "#ffedc2")])
 
         style.configure("TLabel", background=BG, foreground=TEXT, font=(FONT, 10))
         style.configure("Card.TLabel", background=CARD_BG, foreground=TEXT, font=(FONT, 10))
@@ -856,6 +1068,100 @@ class App(tk.Tk):
     def on_new_task(self):
         self.tree.selection_remove(self.tree.selection())
         self._clear_form()
+
+    # --- Exportar / importar ---
+
+    def on_export_tasks(self):
+        tasks = config_store.load_tasks()
+        if not tasks:
+            messagebox.showinfo("Nada que exportar", "No hay tareas guardadas todavía.")
+            return
+        include_passwords = messagebox.askyesno(
+            "Exportar tareas",
+            f"Se exportarán {len(tasks)} tarea(s).\n\n"
+            "¿Incluir las contraseñas en el archivo? Se guardarían SIN CIFRAR, en texto "
+            "plano, así que trata el archivo exportado con cuidado (solo así podrán "
+            "reutilizarse en otro equipo; si eliges que no, tendrás que volver a "
+            "escribirlas después de importar).",
+        )
+        path = filedialog.asksaveasfilename(
+            title="Exportar tareas", defaultextension=".json",
+            initialfile="aLoguear-tareas.json", filetypes=[("JSON", "*.json")],
+        )
+        if not path:
+            return
+        export_tasks = []
+        for task in tasks:
+            entry = {field: task.get(field) for field in _EXPORT_FIELDS}
+            if include_passwords:
+                full = config_store.get_task(task["id"])
+                entry["password"] = full.get("password", "") if full else ""
+            export_tasks.append(entry)
+        data = {
+            "app": APP_NAME,
+            "version": APP_VERSION,
+            "exported_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            "passwords_included": include_passwords,
+            "tasks": export_tasks,
+        }
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except OSError as exc:
+            messagebox.showerror("Error al exportar", str(exc))
+            return
+        messagebox.showinfo("Tareas exportadas", f"Se exportaron {len(export_tasks)} tarea(s) a:\n{path}")
+
+    def on_import_tasks(self):
+        path = filedialog.askopenfilename(title="Importar tareas", filetypes=[("JSON", "*.json")])
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            messagebox.showerror("Error al importar", f"No se pudo leer el archivo:\n{exc}")
+            return
+        tasks = data.get("tasks", [])
+        if not tasks:
+            messagebox.showinfo("Nada que importar", "El archivo no contiene tareas.")
+            return
+        if not messagebox.askyesno(
+            "Importar tareas",
+            f"Se importarán {len(tasks)} tarea(s) como tareas nuevas (no se sobrescribe "
+            "nada existente), pausadas por seguridad. Después tendrás que revisarlas y "
+            "pulsar 'Guardar' en cada una para activarlas y programarlas en Windows.",
+        ):
+            return
+        imported = 0
+        missing_password = 0
+        for entry in tasks:
+            password = entry.get("password", "") or ""
+            if not password:
+                missing_password += 1
+            config_store.save_task(
+                task_id=None,
+                name=entry.get("name", "") or entry.get("url", "Tarea importada"),
+                url=entry.get("url", ""),
+                username=entry.get("username", ""),
+                password=password,
+                headless=entry.get("headless", True),
+                user_selector=entry.get("user_selector", ""),
+                pass_selector=entry.get("pass_selector", ""),
+                submit_selector=entry.get("submit_selector", ""),
+                schedule_time=entry.get("schedule_time", "08:00"),
+                schedule_days=entry.get("schedule_days") or [],
+                keep_alive=entry.get("keep_alive", False),
+                keep_alive_interval_min=entry.get("keep_alive_interval_min", 5),
+                keep_alive_duration_min=entry.get("keep_alive_duration_min", 60),
+                active=False,
+            )
+            imported += 1
+        self._refresh_task_list()
+        message = f"Se importaron {imported} tarea(s), quedaron pausadas."
+        if missing_password:
+            message += f"\n{missing_password} no traían contraseña: complétala y pulsa Guardar."
+        messagebox.showinfo("Tareas importadas", message)
 
     def on_delete_task(self):
         if not self.current_task_id:

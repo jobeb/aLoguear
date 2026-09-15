@@ -1,0 +1,53 @@
+name: Build and release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build GUI executable
+        run: >
+          pyinstaller --noconfirm --onefile --windowed --name aLoguear
+          --icon assets\icon.ico --add-data "assets;assets" gui_config.py
+
+      - name: Build runner executable
+        run: >
+          pyinstaller --noconfirm --onefile --windowed --name aLoguear-runner
+          --icon assets\icon.ico run_login.py
+
+      - name: Package portable zip
+        shell: pwsh
+        run: |
+          $portable = "dist\aLoguear-portable"
+          New-Item -ItemType Directory -Force -Path $portable | Out-Null
+          Copy-Item dist\aLoguear.exe, dist\aLoguear-runner.exe, `
+            register_task.ps1, unregister_task.ps1, list_next_runs.ps1 `
+            -Destination $portable
+          $version = "${{ github.ref_name }}"
+          Compress-Archive -Path "$portable\*" -DestinationPath "dist\aLoguear-$version-win64.zip"
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/aLoguear-*-win64.zip
+          generate_release_notes: true

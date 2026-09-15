@@ -1,2 +1,4 @@
 playwright
 win11toast
+pystray
+pillow
