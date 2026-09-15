@@ -17,6 +17,14 @@ import os
 import sys
 import time
 
+# Debe fijarse ANTES de importar playwright: en el .exe empaquetado (PyInstaller),
+# Playwright resuelve la carpeta de navegadores de forma relativa a la carpeta
+# temporal de extracción en vez de la caché habitual, y no encuentra el Chromium
+# ya descargado con "playwright install". Forzamos siempre la ruta estándar.
+os.environ.setdefault(
+    "PLAYWRIGHT_BROWSERS_PATH", os.path.join(os.environ.get("LOCALAPPDATA", ""), "ms-playwright")
+)
+
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError, Error as PlaywrightError
 
 import config_store
@@ -76,7 +84,10 @@ def init_logging(task_id: str) -> None:
 def log(message: str) -> None:
     timestamp = datetime.datetime.now().isoformat(timespec="seconds")
     line = f"[{timestamp}] {message}"
-    print(line)
+    try:
+        print(line)
+    except Exception:
+        pass  # sin consola en el .exe empaquetado (--windowed): no hay stdout
     if _LOG_FILE:
         with open(_LOG_FILE, "a", encoding="utf-8") as f:
             f.write(line + "\n")
@@ -295,7 +306,10 @@ def keep_session_alive(page, cfg: dict, pass_sel: str | None) -> None:
 
 def main() -> int:
     if len(sys.argv) < 2:
-        print("Uso: python run_login.py <task_id> [--no-keep-alive]", file=sys.stderr)
+        try:
+            print("Uso: python run_login.py <task_id> [--no-keep-alive]", file=sys.stderr)
+        except Exception:
+            pass
         return 2
     task_id = sys.argv[1]
     no_keep_alive = "--no-keep-alive" in sys.argv[2:]

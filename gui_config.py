@@ -11,11 +11,43 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
+import urllib.error
+import urllib.request
+import webbrowser
 from tkinter import messagebox, ttk
 
 import config_store
+from version import __version__ as APP_VERSION, GITHUB_REPO
 
 _NET_DATE_RE = re.compile(r"/Date\((\d+)\)/")
+
+
+def _parse_version(text: str) -> tuple:
+    text = text.strip().lstrip("vV")
+    parts = re.findall(r"\d+", text)
+    return tuple(int(p) for p in parts) or (0,)
+
+
+def check_for_update() -> tuple[str, str] | None:
+    """Consulta el último release de GitHub. Devuelve (version, url) si hay
+    una versión más nueva que la instalada, o None (sin release, sin
+    conexión, o ya estamos al día). No debe lanzar excepciones nunca."""
+    try:
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
+            headers={"Accept": "application/vnd.github+json", "User-Agent": "aLoguear-update-check"},
+        )
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        latest_tag = data.get("tag_name", "")
+        if not latest_tag:
+            return None
+        if _parse_version(latest_tag) > _parse_version(APP_VERSION):
+            html_url = data.get("html_url") or f"https://github.com/{GITHUB_REPO}/releases/latest"
+            return latest_tag, html_url
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError, OSError):
+        pass
+    return None
 
 DAYS = [
     ("Lu", "Monday"),
@@ -144,7 +176,28 @@ class ToolTip:
 
 
 APP_NAME = "aLoguear"
-ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+if getattr(sys, "frozen", False):
+    ASSETS_DIR = os.path.join(sys._MEIPASS, "assets")
+else:
+    ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+
+
+def _script_dir_global() -> str:
+    """Directorio donde viven los .ps1 (y, en modo empaquetado, los .exe
+    hermanos): junto al .exe si está congelado, o junto a este .py si no."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _runner_command(*args) -> list:
+    """Comando para ejecutar run_login.py, tanto en modo desarrollo (con
+    Python) como empaquetado (usa el .exe hermano aLoguear-runner.exe)."""
+    if getattr(sys, "frozen", False):
+        exe_dir = os.path.dirname(sys.executable)
+        return [os.path.join(exe_dir, "aLoguear-runner.exe"), *args]
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    return [sys.executable, os.path.join(script_dir, "run_login.py"), *args]
 
 
 class App(tk.Tk):
@@ -173,10 +226,22 @@ class App(tk.Tk):
             style="SubHeader.TLabel"
         ).pack(anchor="w", padx=20, pady=(2, 16))
 
+        # --- Aviso de actualización disponible (oculto hasta comprobarlo) ---
+        self.update_banner = ttk.Frame(self, style="UpdateBanner.TFrame")
+        self._update_url = None
+        self.update_label = ttk.Label(self.update_banner, text="", style="UpdateBanner.TLabel")
+        self.update_label.pack(side="left", padx=(16, 8), pady=6)
+        ttk.Button(
+            self.update_banner, text="Ver novedades", style="UpdateBanner.TButton",
+            command=lambda: webbrowser.open(self._update_url) if self._update_url else None,
+        ).pack(side="left")
+        self.after(800, self._start_update_check)
+
         # --- Contenedor con scroll (para que la ventana no dependa de caber
         #     entera en pantalla) ---
         scroll_container = ttk.Frame(self, style="TFrame")
         scroll_container.pack(fill="both", expand=True)
+        self.scroll_container = scroll_container
 
         canvas = tk.Canvas(scroll_container, bg=BG, highlightthickness=0)
         scrollbar = ttk.Scrollbar(scroll_container, orient="vertical", command=canvas.yview)
@@ -504,6 +569,21 @@ class App(tk.Tk):
         except tk.TclError:
             pass
 
+    # --- Actualizaciones ---
+
+    def _start_update_check(self):
+        threading.Thread(target=self._run_update_check, daemon=True).start()
+
+    def _run_update_check(self):
+        result = check_for_update()
+        if result:
+            self.after(0, lambda: self._show_update_banner(*result))
+
+    def _show_update_banner(self, latest_version: str, url: str):
+        self._update_url = url
+        self.update_label.configure(text=f"🔔  Hay una nueva versión disponible: {latest_version} (tienes {APP_VERSION})")
+        self.update_banner.pack(fill="x", before=self.scroll_container)
+
     # --- Estilo ---
 
     def _setup_style(self):
@@ -519,6 +599,14 @@ class App(tk.Tk):
         style.configure("Header.TFrame", background=ACCENT)
         style.configure("Header.TLabel", background=ACCENT, foreground="white", font=(FONT, 16, "bold"))
         style.configure("SubHeader.TLabel", background=ACCENT, foreground="#e3e2ff", font=(FONT, 9))
+
+        style.configure("UpdateBanner.TFrame", background="#fff7e0")
+        style.configure("UpdateBanner.TLabel", background="#fff7e0", foreground="#8a6100", font=(FONT, 9, "bold"))
+        style.configure(
+            "UpdateBanner.TButton", font=(FONT, 8, "bold"), padding=(8, 3),
+            background="#8a6100", foreground="white", borderwidth=0, relief="flat"
+        )
+        style.map("UpdateBanner.TButton", background=[("active", "#6b4b00")])
 
         style.configure("TLabel", background=BG, foreground=TEXT, font=(FONT, 10))
         style.configure("Card.TLabel", background=CARD_BG, foreground=TEXT, font=(FONT, 10))
@@ -731,7 +819,7 @@ class App(tk.Tk):
             threading.Thread(target=self._fetch_next_runs, args=(active_ids,), daemon=True).start()
 
     def _fetch_next_runs(self, task_ids: list):
-        script_dir = os.path.dirname(os.path.abspath(__file__))
+        script_dir = _script_dir_global()
         ps_script = os.path.join(script_dir, "list_next_runs.ps1")
         next_runs = {}
         try:
@@ -787,7 +875,7 @@ class App(tk.Tk):
         threading.Thread(target=self._unregister_task, args=(task_id,), daemon=True).start()
 
     def _unregister_task(self, task_id: str):
-        script_dir = os.path.dirname(os.path.abspath(__file__))
+        script_dir = _script_dir_global()
         ps_script = os.path.join(script_dir, "unregister_task.ps1")
         subprocess.run(
             ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps_script, "-TaskId", task_id],
@@ -958,10 +1046,13 @@ class App(tk.Tk):
         ).start()
 
     def _save_and_sync_schedule_thread(self, task_id: str, active: bool, time_str: str, days: list):
-        script_dir = os.path.dirname(os.path.abspath(__file__))
+        script_dir = _script_dir_global()
         if active:
             ps_script = os.path.join(script_dir, "register_task.ps1")
             args = ["-TaskId", task_id, "-Time", time_str, "-Days", ",".join(days)]
+            if getattr(sys, "frozen", False):
+                runner_exe = os.path.join(script_dir, "aLoguear-runner.exe")
+                args += ["-RunnerExe", runner_exe]
         else:
             ps_script = os.path.join(script_dir, "unregister_task.ps1")
             args = ["-TaskId", task_id]
@@ -1001,10 +1092,9 @@ class App(tk.Tk):
         threading.Thread(target=self._run_test, args=(self.current_task_id,), daemon=True).start()
 
     def _run_test(self, task_id: str):
+        cmd = _runner_command(task_id, "--no-keep-alive")
         result = subprocess.run(
-            [sys.executable, "run_login.py", task_id, "--no-keep-alive"],
-            cwd=os.path.dirname(os.path.abspath(__file__)),
-            capture_output=True, text=True,
+            cmd, cwd=os.path.dirname(cmd[0]), capture_output=True, text=True,
         )
         ok = result.returncode == 0
         message = "✓ Login ejecutado correctamente." if ok else (

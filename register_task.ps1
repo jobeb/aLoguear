@@ -15,6 +15,12 @@
 .PARAMETER TaskName
     Nombre de la tarea en el Programador de tareas. Por defecto "AutoLogin_<TaskId>".
 
+.PARAMETER RunnerExe
+    Ruta a aLoguear-runner.exe (versión empaquetada). Si se indica, la tarea
+    ejecuta ese .exe directamente y no hace falta tener Python instalado. Si
+    se omite, se resuelve python.exe mediante el lanzador "py" (modo
+    desarrollo, ejecutando run_login.py).
+
 .NOTES
     La contraseña se descifra con DPAPI ligado a tu usuario de Windows, por lo
     que la tarea se registra con inicio de sesión "Interactive": solo se
@@ -26,7 +32,8 @@ param(
     [string]$TaskId,
     [string]$Time = "08:00",
     [string]$Days = "Monday,Tuesday,Wednesday,Thursday,Friday,Saturday,Sunday",
-    [string]$TaskName = ""
+    [string]$TaskName = "",
+    [string]$RunnerExe = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -36,26 +43,32 @@ if (-not $TaskName) {
 }
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$runScript = Join-Path $scriptDir "run_login.py"
 
 $dayList = $Days -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" }
 if (-not $dayList -or $dayList.Count -eq 0) {
     throw "Debes indicar al menos un día en -Days."
 }
 
-# Resuelve la ruta real del intérprete de Python a través del lanzador "py",
-# ya que python.exe no siempre está en el PATH del sistema.
-$pythonExe = & py -c "import sys; print(sys.executable)"
-if (-not $pythonExe -or -not (Test-Path $pythonExe)) {
-    throw "No se pudo resolver python.exe mediante el lanzador 'py'. Instala Python o ajusta este script."
+if ($RunnerExe) {
+    if (-not (Test-Path $RunnerExe)) {
+        throw "No se encontró el ejecutable indicado en -RunnerExe: $RunnerExe"
+    }
+    $action = New-ScheduledTaskAction -Execute $RunnerExe -Argument "`"$TaskId`"" -WorkingDirectory (Split-Path $RunnerExe)
+} else {
+    # Resuelve la ruta real del intérprete de Python a través del lanzador "py",
+    # ya que python.exe no siempre está en el PATH del sistema.
+    $runScript = Join-Path $scriptDir "run_login.py"
+    $pythonExe = & py -c "import sys; print(sys.executable)"
+    if (-not $pythonExe -or -not (Test-Path $pythonExe)) {
+        throw "No se pudo resolver python.exe mediante el lanzador 'py'. Instala Python o ajusta este script."
+    }
+    # Usa pythonw.exe (sin consola) si está disponible junto a python.exe
+    $pythonwExe = Join-Path (Split-Path $pythonExe) "pythonw.exe"
+    if (-not (Test-Path $pythonwExe)) {
+        $pythonwExe = $pythonExe
+    }
+    $action = New-ScheduledTaskAction -Execute $pythonwExe -Argument "`"$runScript`" `"$TaskId`"" -WorkingDirectory $scriptDir
 }
-# Usa pythonw.exe (sin consola) si está disponible junto a python.exe
-$pythonwExe = Join-Path (Split-Path $pythonExe) "pythonw.exe"
-if (-not (Test-Path $pythonwExe)) {
-    $pythonwExe = $pythonExe
-}
-
-$action = New-ScheduledTaskAction -Execute $pythonwExe -Argument "`"$runScript`" `"$TaskId`"" -WorkingDirectory $scriptDir
 $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek $dayList -At $Time
 $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
 $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
