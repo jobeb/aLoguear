@@ -1,4 +1,4 @@
 """Versión de la aplicación y datos del repositorio, usados para comprobar
 si hay una actualización disponible en GitHub Releases."""
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 GITHUB_REPO = "jobeb/aLoguear"

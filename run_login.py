@@ -14,6 +14,7 @@ pulsar "Probar ahora" para no bloquear la interfaz).
 """
 import datetime
 import os
+import subprocess
 import sys
 import time
 
@@ -147,6 +148,34 @@ def notify_failure(cfg: dict, message: str) -> None:
         _toast(f"AutoLogin: {cfg.get('name', cfg.get('url', ''))}", message, duration="long")
     except Exception as exc:
         log(f"No se pudo mostrar la notificación de Windows: {exc}")
+
+
+def ensure_chromium_installed() -> bool:
+    """Descarga Chromium de Playwright si aún no está instalado (misma acción
+    que 'playwright install chromium' desde la terminal). El .exe empaquetado
+    no tiene esa CLI disponible en el PATH, así que invocamos directamente el
+    driver que Playwright ya trae dentro del propio paquete. Devuelve True si
+    quedó instalado (o ya lo estaba)."""
+    try:
+        from playwright._impl._driver import compute_driver_executable, get_driver_env
+    except Exception as exc:
+        log(f"No se pudo localizar el instalador de Playwright: {exc}")
+        return False
+    try:
+        node, cli = compute_driver_executable()
+        log("Chromium no está instalado; descargándolo (puede tardar uno o dos minutos)...")
+        result = subprocess.run(
+            [node, cli, "install", "chromium"],
+            env=get_driver_env(), capture_output=True, text=True, timeout=600,
+        )
+        if result.returncode != 0:
+            log(f"La descarga de Chromium terminó con errores: {(result.stderr or result.stdout).strip()}")
+            return False
+        log("Chromium instalado correctamente.")
+        return True
+    except Exception as exc:
+        log(f"No se pudo instalar Chromium automáticamente: {exc}")
+        return False
 
 
 def perform_login(page, cfg: dict, expect_login_form: bool = True):
@@ -325,10 +354,16 @@ def main() -> int:
     has_saved_session = os.path.exists(session_path)
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(
+        launch_kwargs = dict(
             headless=cfg.get("headless", True),
             args=["--disable-blink-features=AutomationControlled"],
         )
+        try:
+            browser = p.chromium.launch(**launch_kwargs)
+        except PlaywrightError as exc:
+            if "Executable doesn't exist" not in str(exc) or not ensure_chromium_installed():
+                raise
+            browser = p.chromium.launch(**launch_kwargs)
         context = browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
