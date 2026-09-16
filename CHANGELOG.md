@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.3.5
 - `config_store`: rutas resueltas en cada llamada, tolera `tasks.json` corrupto y `password_enc` ausente/inválido, escritura atómica (`.tmp` + `os.replace`), `LOCALAPPDATA` con fallback.
 - `crypto_utils`: rechaza cifrar cadena vacía (se guarda como `""` sin DPAPI).
 - `gui_config`: valida URL http(s), hora y keep-alive sin reventar; importa solo entradas con URL válida y normaliza hora/días; cwd del runner corregido; orden cronológico en Última/Próxima; auto-update verifica SHA256 y bloquea si falla; aviso de keep-alive indefinido.
