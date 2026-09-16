@@ -360,6 +360,19 @@ def _script_dir_global() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
+def _unblock_ps_scripts(script_dir: str) -> None:
+    """Quita la marca "descargado de Internet" (Zone.Identifier) de los .ps1
+    junto al ejecutable. Si no se quita, la directiva RemoteSigned que suele
+    venir forzada por GPO bloquea su ejecución aunque se lancen con
+    -ExecutionPolicy Bypass: esa directiva de Machine/GPO tiene prioridad
+    sobre el flag pasado por línea de comandos."""
+    for name in ("register_task.ps1", "unregister_task.ps1", "list_next_runs.ps1"):
+        try:
+            os.remove(os.path.join(script_dir, name) + ":Zone.Identifier")
+        except OSError:
+            pass
+
+
 def _runner_command(*args) -> list:
     """Comando para ejecutar run_login.py, tanto en modo desarrollo (con
     Python) como empaquetado (usa el .exe hermano aLoguear-runner.exe)."""
@@ -380,6 +393,8 @@ class App(tk.Tk):
         self.current_task_id = None
         self.tray_icon = None
         self._tray_hint_shown = False
+
+        _unblock_ps_scripts(_script_dir_global())
 
         self._setup_style()
         self.configure(bg=BG)
