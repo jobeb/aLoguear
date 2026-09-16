@@ -3,8 +3,8 @@ y un PNG para usar dentro de la propia GUI. Se ejecuta una sola vez; el
 resultado se versiona junto al resto de la app."""
 from PIL import Image, ImageDraw
 
-ACCENT = (79, 70, 229, 255)       # #4f46e5
-ACCENT_DARK = (67, 56, 202, 255)  # #4338ca
+ACCENT = (13, 148, 136, 255)       # #0d9488
+ACCENT_DARK = (15, 118, 110, 255)  # #0f766e
 WHITE = (255, 255, 255, 255)
 
 SIZE = 256

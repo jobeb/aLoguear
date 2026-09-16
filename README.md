@@ -22,6 +22,11 @@ sesión activa (por ejemplo, campus virtuales de formación).
 - Icono en la bandeja del sistema: cerrar la ventana la minimiza en vez de salir.
 - Comprobación de actualizaciones y, en la versión portable, actualización con un clic
   (descarga la nueva versión y se reemplaza sola).
+- Modo oscuro/claro automático según el tema de Windows.
+- Buscador y ordenación por columnas en la lista de tareas.
+- Visor de log integrado y modo "solo detección" (comprueba los selectores sin enviar
+  ningún dato, para configurar un sitio nuevo sin arriesgarte a un bloqueo).
+- Rotación de logs y espera progresiva entre reintentos.
 
 ## Requisitos
 
@@ -33,6 +38,14 @@ sesión activa (por ejemplo, campus virtuales de formación).
 Descarga el `.zip` de la [última versión](https://github.com/jobeb/aLoguear/releases/latest),
 descomprímelo donde quieras y ejecuta `aLoguear.exe`. No hace falta instalar nada más:
 la app descarga Chromium sola la primera vez que hace falta.
+
+Cada release incluye también un archivo `.sha256` con la huella del `.zip`, por si quieres
+verificar que la descarga no se corrompió o alteró:
+
+```powershell
+Get-FileHash aLoguear-vX.Y.Z-win64.zip -Algorithm SHA256
+# compara el resultado con el contenido del .sha256 adjunto
+```
 
 > **Aviso de Windows SmartScreen**: al ejecutar `aLoguear.exe` por primera vez, Windows
 > puede mostrar "Windows protegió tu PC" porque el ejecutable no está firmado con un

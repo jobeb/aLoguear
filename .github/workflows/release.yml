@@ -44,10 +44,15 @@ jobs:
             register_task.ps1, unregister_task.ps1, list_next_runs.ps1 `
             -Destination $portable
           $version = "${{ github.ref_name }}"
-          Compress-Archive -Path "$portable\*" -DestinationPath "dist\aLoguear-$version-win64.zip"
+          $zip = "dist\aLoguear-$version-win64.zip"
+          Compress-Archive -Path "$portable\*" -DestinationPath $zip
+          $hash = (Get-FileHash -Path $zip -Algorithm SHA256).Hash
+          "$hash  $(Split-Path $zip -Leaf)" | Out-File -FilePath "$zip.sha256" -Encoding ascii -NoNewline
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/aLoguear-*-win64.zip
+          files: |
+            dist/aLoguear-*-win64.zip
+            dist/aLoguear-*-win64.zip.sha256
           generate_release_notes: true

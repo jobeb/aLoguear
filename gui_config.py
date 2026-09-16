@@ -84,8 +84,13 @@ DAY_LABELS = {name: label for label, name in DAYS}
 
 FONT = "Segoe UI"
 
+# Paleta de colores: se rellena en tiempo de ejecución según el tema claro/oscuro
+# de Windows (ver _detect_windows_dark_mode / _apply_palette), pero se definen
+# aquí con valores de tema claro por defecto para que el módulo sea importable
+# sin haber llamado antes a _apply_palette().
 BG = "#f3f4f8"
 CARD_BG = "#ffffff"
+INNER_BG = "#f8f9fd"
 BORDER = "#e3e5ee"
 TEXT = "#1f2330"
 MUTED = "#6b7280"
@@ -95,6 +100,66 @@ ACCENT_LIGHT = "#eef0ff"
 SUCCESS = "#0f7d3c"
 DANGER = "#b3261e"
 DANGER_LIGHT = "#fdecea"
+SECONDARY_BG = "#e6ecec"
+SECONDARY_HOVER = "#d7e2e1"
+SECONDARY_PRESS = "#c6d6d4"
+DISABLED_BG = "#a9d9d2"
+DISABLED_FG = "#eafaf7"
+
+
+def _detect_windows_dark_mode() -> bool:
+    try:
+        import winreg
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+        )
+        value, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+        return value == 0
+    except Exception:
+        return False
+
+
+def _apply_palette(dark: bool) -> None:
+    global BG, CARD_BG, INNER_BG, BORDER, TEXT, MUTED, ACCENT, ACCENT_DARK, ACCENT_LIGHT
+    global SUCCESS, DANGER, DANGER_LIGHT, SECONDARY_BG, SECONDARY_HOVER, SECONDARY_PRESS
+    global DISABLED_BG, DISABLED_FG
+    if dark:
+        BG = "#1b1c22"
+        CARD_BG = "#24262f"
+        INNER_BG = "#2c2f3a"
+        BORDER = "#3a3d4a"
+        TEXT = "#e8e9ee"
+        MUTED = "#9a9db0"
+        ACCENT = "#2dd4bf"
+        ACCENT_DARK = "#5eead4"
+        ACCENT_LIGHT = "#1b3a37"
+        SUCCESS = "#4ade80"
+        DANGER = "#f87171"
+        DANGER_LIGHT = "#3a2427"
+        SECONDARY_BG = "#2b3a39"
+        SECONDARY_HOVER = "#33443f"
+        SECONDARY_PRESS = "#3b4f4a"
+        DISABLED_BG = "#1f4542"
+        DISABLED_FG = "#5f7d78"
+    else:
+        BG = "#f3f4f8"
+        CARD_BG = "#ffffff"
+        INNER_BG = "#f8f9fd"
+        BORDER = "#e3e5ee"
+        TEXT = "#1f2330"
+        MUTED = "#6b7280"
+        ACCENT = "#0d9488"
+        ACCENT_DARK = "#0f766e"
+        ACCENT_LIGHT = "#ccfbf1"
+        SUCCESS = "#0f7d3c"
+        DANGER = "#b3261e"
+        DANGER_LIGHT = "#fdecea"
+        SECONDARY_BG = "#e6ecec"
+        SECONDARY_HOVER = "#d7e2e1"
+        SECONDARY_PRESS = "#c6d6d4"
+        DISABLED_BG = "#a9d9d2"
+        DISABLED_FG = "#eafaf7"
 
 
 _EXPORT_FIELDS = [
@@ -270,13 +335,13 @@ class App(tk.Tk):
         self.title(APP_NAME)
         self.resizable(True, True)
         self.minsize(480, 560)
-        self.configure(bg=BG)
 
         self.current_task_id = None
         self.tray_icon = None
         self._tray_hint_shown = False
 
         self._setup_style()
+        self.configure(bg=BG)
         self._set_app_icon()
         self.protocol("WM_DELETE_WINDOW", self._on_close_button)
 
@@ -351,8 +416,19 @@ class App(tk.Tk):
         add_row = ttk.Frame(list_card, style="Card.TFrame")
         add_row.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         add_row.grid_columnconfigure(0, weight=1)
+
+        search_row = ttk.Frame(add_row, style="Card.TFrame")
+        search_row.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+        search_row.grid_columnconfigure(1, weight=1)
+        ttk.Label(search_row, text="🔍", style="Card.TLabel").grid(row=0, column=0, padx=(0, 4))
+        self.search_var = tk.StringVar()
+        self.search_var.trace_add("write", lambda *_: self._refresh_task_list())
+        search_entry = ttk.Entry(search_row, textvariable=self.search_var)
+        search_entry.grid(row=0, column=1, sticky="ew")
+        ToolTip(search_entry, "Filtrar la lista por nombre o URL.")
+
         list_btns = ttk.Frame(add_row, style="Card.TFrame")
-        list_btns.grid(row=0, column=0, sticky="e")
+        list_btns.grid(row=0, column=1, sticky="e")
 
         export_btn = ttk.Button(
             list_btns, text="Exportar", style="IconGhost.TButton", command=self.on_export_tasks
@@ -376,11 +452,13 @@ class App(tk.Tk):
             list_card, columns=("time", "days", "last", "next"), show="tree headings", height=5,
             selectmode="browse", style="Card.Treeview"
         )
-        self.tree.heading("#0", text="Nombre")
-        self.tree.heading("time", text="Hora")
-        self.tree.heading("days", text="Días")
-        self.tree.heading("last", text="Última ejecución")
-        self.tree.heading("next", text="Próxima ejecución")
+        self._sort_column = None
+        self._sort_reverse = False
+        self.tree.heading("#0", text="Nombre", command=lambda: self._sort_tree("#0"))
+        self.tree.heading("time", text="Hora", command=lambda: self._sort_tree("time"))
+        self.tree.heading("days", text="Días", command=lambda: self._sort_tree("days"))
+        self.tree.heading("last", text="Última ejecución", command=lambda: self._sort_tree("last"))
+        self.tree.heading("next", text="Próxima ejecución", command=lambda: self._sort_tree("next"))
         self.tree.column("#0", width=140, stretch=True)
         self.tree.column("time", width=48, anchor="center", stretch=False)
         self.tree.column("days", width=85, anchor="center", stretch=False)
@@ -412,20 +490,25 @@ class App(tk.Tk):
         mode_row.grid_columnconfigure(0, weight=1)
         self.mode_label = ttk.Label(mode_row, text="🆕  Nueva tarea", style="Mode.TLabel")
         self.mode_label.grid(row=0, column=0, sticky="w")
+        self.log_btn = ttk.Button(
+            mode_row, text="📄", style="IconGhost.TButton", width=3, command=self.on_view_log
+        )
+        self.log_btn.grid(row=0, column=1, sticky="e", padx=(0, 6))
+        ToolTip(self.log_btn, "Ver el registro (log) completo de esta tarea.")
         self.screenshot_btn = ttk.Button(
             mode_row, text="🖼", style="IconGhost.TButton", width=3, command=self.on_view_screenshot
         )
-        self.screenshot_btn.grid(row=0, column=1, sticky="e", padx=(0, 6))
+        self.screenshot_btn.grid(row=0, column=2, sticky="e", padx=(0, 6))
         ToolTip(self.screenshot_btn, "Ver la última captura de pantalla guardada de un login fallido.")
         self.duplicate_btn = ttk.Button(
             mode_row, text="📋", style="IconGhost.TButton", width=3, command=self.on_duplicate_task
         )
-        self.duplicate_btn.grid(row=0, column=2, sticky="e", padx=(0, 6))
+        self.duplicate_btn.grid(row=0, column=3, sticky="e", padx=(0, 6))
         ToolTip(self.duplicate_btn, "Duplicar esta tarea como una tarea nueva (sin guardar todavía).")
         self.delete_btn = ttk.Button(
             mode_row, text="🗑", style="IconDanger.TButton", width=3, command=self.on_delete_task
         )
-        self.delete_btn.grid(row=0, column=3, sticky="e")
+        self.delete_btn.grid(row=0, column=4, sticky="e")
         ToolTip(self.delete_btn, "Eliminar esta tarea y su tarea programada de Windows.")
         frow += 1
 
@@ -622,8 +705,18 @@ class App(tk.Tk):
         self.test_btn = ttk.Button(
             btn_frame, text="▶  Probar ahora", style="Secondary.TButton", command=self.on_test
         )
-        self.test_btn.grid(row=0, column=1)
+        self.test_btn.grid(row=0, column=1, padx=(8, 8))
         ToolTip(self.test_btn, "Guarda esta tarea y ejecuta un login de prueba ahora mismo.")
+        self.detect_btn = ttk.Button(
+            btn_frame, text="🔍  Probar detección", style="Secondary.TButton", command=self.on_detect_only
+        )
+        self.detect_btn.grid(row=0, column=2)
+        ToolTip(
+            self.detect_btn,
+            "Comprueba si encuentra los campos de usuario/contraseña/botón SIN enviar "
+            "nada (útil para validar selectores en un sitio nuevo sin arriesgarte a un "
+            "bloqueo por intento de login fallido).",
+        )
 
         self.status_var = tk.StringVar(value="")
         self.status_label = ttk.Label(outer, textvariable=self.status_var, style="Success.TLabel", wraplength=430)
@@ -640,6 +733,23 @@ class App(tk.Tk):
         self.geometry(f"{max(content_width, 480)}x{max(max_height, 480)}")
 
     # --- Icono ---
+
+    def _apply_titlebar_theme(self):
+        """Oscurece la barra de título nativa de Windows si toca tema oscuro
+        (si no, se queda blanca aunque el resto de la ventana esté oscuro)."""
+        if not self.is_dark:
+            return
+        try:
+            import ctypes
+            self.update_idletasks()
+            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+            value = ctypes.c_int(1)
+            for attribute in (20, 19):  # DWMWA_USE_IMMERSIVE_DARK_MODE (20 en Win10 2004+, 19 en versiones previas)
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd, attribute, ctypes.byref(value), ctypes.sizeof(value)
+                )
+        except Exception:
+            pass
 
     def _set_app_icon(self):
         self._logo_img = None
@@ -793,6 +903,10 @@ class App(tk.Tk):
     # --- Estilo ---
 
     def _setup_style(self):
+        self.is_dark = _detect_windows_dark_mode()
+        _apply_palette(self.is_dark)
+        self._apply_titlebar_theme()
+
         style = ttk.Style(self)
         try:
             style.theme_use("clam")
@@ -804,7 +918,7 @@ class App(tk.Tk):
 
         style.configure("Header.TFrame", background=ACCENT)
         style.configure("Header.TLabel", background=ACCENT, foreground="white", font=(FONT, 16, "bold"))
-        style.configure("SubHeader.TLabel", background=ACCENT, foreground="#e3e2ff", font=(FONT, 9))
+        style.configure("SubHeader.TLabel", background=ACCENT, foreground="#dffaf5", font=(FONT, 9))
 
         style.configure("UpdateBanner.TFrame", background="#fff7e0")
         style.configure("UpdateBanner.TLabel", background="#fff7e0", foreground="#8a6100", font=(FONT, 9, "bold"))
@@ -837,11 +951,11 @@ class App(tk.Tk):
             font=(FONT, 10, "bold")
         )
         style.configure(
-            "Inner.TLabelframe", background="#f8f9fd", bordercolor=BORDER,
+            "Inner.TLabelframe", background=INNER_BG, bordercolor=BORDER,
             relief="solid", borderwidth=1
         )
         style.configure(
-            "Inner.TLabelframe.Label", background="#f8f9fd", foreground=MUTED,
+            "Inner.TLabelframe.Label", background=INNER_BG, foreground=MUTED,
             font=(FONT, 9, "bold")
         )
 
@@ -858,15 +972,15 @@ class App(tk.Tk):
             style.map(st, background=[("active", CARD_BG)], foreground=[("active", ACCENT)])
 
         style.configure(
-            "TEntry", fieldbackground="white", foreground=TEXT,
+            "TEntry", fieldbackground=INNER_BG, foreground=TEXT,
             bordercolor=BORDER, lightcolor=BORDER, darkcolor=BORDER,
-            padding=7, relief="solid"
+            padding=7, relief="solid", insertcolor=TEXT
         )
         style.map("TEntry", bordercolor=[("focus", ACCENT)])
 
         style.configure(
-            "TSpinbox", fieldbackground="white", foreground=TEXT,
-            bordercolor=BORDER, arrowsize=12, padding=4
+            "TSpinbox", fieldbackground=INNER_BG, foreground=TEXT,
+            bordercolor=BORDER, arrowsize=12, padding=4, insertcolor=TEXT
         )
 
         # Botones
@@ -876,15 +990,15 @@ class App(tk.Tk):
         )
         style.map(
             "Accent.TButton",
-            background=[("disabled", "#c9c8e8"), ("active", ACCENT_DARK), ("pressed", ACCENT_DARK)],
-            foreground=[("disabled", "#f1f1fb")],
+            background=[("disabled", DISABLED_BG), ("active", ACCENT_DARK), ("pressed", ACCENT_DARK)],
+            foreground=[("disabled", DISABLED_FG)],
         )
 
         style.configure(
             "Secondary.TButton", font=(FONT, 9), padding=(14, 8),
-            background="#e9eaf2", foreground=TEXT, borderwidth=0, relief="flat"
+            background=SECONDARY_BG, foreground=TEXT, borderwidth=0, relief="flat"
         )
-        style.map("Secondary.TButton", background=[("active", "#dcdeed"), ("pressed", "#cfd1e6")])
+        style.map("Secondary.TButton", background=[("active", SECONDARY_HOVER), ("pressed", SECONDARY_PRESS)])
 
         style.configure(
             "AccentSmall.TButton", font=(FONT, 8, "bold"), padding=(9, 4),
@@ -947,7 +1061,7 @@ class App(tk.Tk):
 
         # Treeview
         style.configure(
-            "Card.Treeview", background="white", fieldbackground="white",
+            "Card.Treeview", background=CARD_BG, fieldbackground=CARD_BG,
             foreground=TEXT, rowheight=26, font=(FONT, 9), borderwidth=0
         )
         style.configure(
@@ -994,7 +1108,15 @@ class App(tk.Tk):
 
     def _refresh_task_list(self, select_id: str | None = None):
         self.tree.delete(*self.tree.get_children())
-        tasks = config_store.load_tasks()
+        all_tasks = config_store.load_tasks()
+        query = self.search_var.get().strip().lower() if hasattr(self, "search_var") else ""
+        if query:
+            tasks = [
+                t for t in all_tasks
+                if query in (t.get("name") or "").lower() or query in (t.get("url") or "").lower()
+            ]
+        else:
+            tasks = all_tasks
         active_ids = []
         for task in tasks:
             active = task.get("active", True)
@@ -1024,6 +1146,10 @@ class App(tk.Tk):
         if tasks:
             self.empty_hint.grid_remove()
         else:
+            self.empty_hint.configure(
+                text="Ninguna tarea coincide con la búsqueda." if query
+                else "No hay tareas todavía. Pulsa \"Añadir tarea\" para crear la primera."
+            )
             self.empty_hint.grid(row=3, column=0, sticky="w", pady=(8, 0))
         self._resize_to_content()
 
@@ -1053,6 +1179,22 @@ class App(tk.Tk):
             if not self.tree.exists(task_id):
                 continue
             self.tree.set(task_id, "next", _format_net_date(next_runs.get(task_id)))
+
+    def _sort_tree(self, col: str):
+        reverse = self._sort_column == col and not self._sort_reverse
+        children = list(self.tree.get_children(""))
+
+        def sort_key(iid):
+            value = self.tree.item(iid, "text") if col == "#0" else self.tree.set(iid, col)
+            # Para "Última/Próxima ejecución", ordena por el texto tras el icono/fecha
+            # igual que se muestra (orden alfabético es suficiente aquí).
+            return value.lower() if isinstance(value, str) else value
+
+        children.sort(key=sort_key, reverse=reverse)
+        for index, iid in enumerate(children):
+            self.tree.move(iid, "", index)
+        self._sort_column = col
+        self._sort_reverse = reverse
 
     def _on_tree_select(self, _event=None):
         selection = self.tree.selection()
@@ -1194,6 +1336,57 @@ class App(tk.Tk):
         else:
             self.screenshot_btn.grid_remove()
 
+    def _refresh_log_button(self):
+        if self.current_task_id and os.path.exists(config_store.log_path(self.current_task_id)):
+            self.log_btn.grid()
+        else:
+            self.log_btn.grid_remove()
+
+    def on_view_log(self):
+        if not self.current_task_id:
+            return
+        path = config_store.log_path(self.current_task_id)
+        if not os.path.exists(path):
+            messagebox.showinfo("Sin registro", "Todavía no hay ningún log guardado para esta tarea.")
+            return
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+        except OSError as exc:
+            messagebox.showerror("Error al leer el log", str(exc))
+            return
+
+        win = tk.Toplevel(self)
+        win.title(f"Log — {self.name_var.get() or self.current_task_id}")
+        win.geometry("720x520")
+        win.configure(bg=BG)
+
+        text_frame = ttk.Frame(win, style="TFrame", padding=10)
+        text_frame.pack(fill="both", expand=True)
+        text_frame.grid_columnconfigure(0, weight=1)
+        text_frame.grid_rowconfigure(0, weight=1)
+
+        text = tk.Text(
+            text_frame, wrap="word", font=("Consolas", 9),
+            background=CARD_BG, foreground=TEXT, insertbackground=TEXT,
+            relief="flat", padx=8, pady=8,
+        )
+        scroll = ttk.Scrollbar(text_frame, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=scroll.set)
+        text.grid(row=0, column=0, sticky="nsew")
+        scroll.grid(row=0, column=1, sticky="ns")
+
+        text.insert("1.0", content)
+        text.configure(state="disabled")
+        text.see("end")
+
+        btn_row = ttk.Frame(win, style="TFrame", padding=(10, 0, 10, 10))
+        btn_row.pack(fill="x")
+        ttk.Button(
+            btn_row, text="Abrir carpeta", style="Secondary.TButton",
+            command=lambda: os.startfile(os.path.dirname(path)),
+        ).pack(side="left")
+
     def on_view_screenshot(self):
         if not self.current_task_id:
             return
@@ -1217,6 +1410,7 @@ class App(tk.Tk):
         self.delete_btn.grid_remove()
         self.duplicate_btn.grid_remove()
         self.screenshot_btn.grid_remove()
+        self.log_btn.grid_remove()
         self.status_var.set("Revisa los datos y pulsa Guardar para crear la copia como tarea independiente.")
 
     def _clear_form(self):
@@ -1244,6 +1438,7 @@ class App(tk.Tk):
         self.delete_btn.grid_remove()
         self.duplicate_btn.grid_remove()
         self.screenshot_btn.grid_remove()
+        self.log_btn.grid_remove()
 
     def _populate_form(self, data: dict):
         self.name_var.set(data.get("name", ""))
@@ -1285,6 +1480,7 @@ class App(tk.Tk):
         self.delete_btn.grid()
         self.duplicate_btn.grid()
         self._refresh_screenshot_button()
+        self._refresh_log_button()
 
     # --- Guardar / validar ---
 
@@ -1413,10 +1609,41 @@ class App(tk.Tk):
         self.test_btn.configure(state="normal")
         self._refresh_task_list(select_id=self.current_task_id)
         self._refresh_screenshot_button()
+        self._refresh_log_button()
         self.status_label.configure(style="Success.TLabel" if ok else "Danger.TLabel")
         self.status_var.set(message)
         if not ok:
             messagebox.showwarning("Resultado de la prueba", message)
+
+    # --- Probar detección (sin enviar nada) ---
+
+    def on_detect_only(self):
+        if not self._save():
+            return
+        self.status_label.configure(style="Info.TLabel")
+        self.status_var.set("Comprobando los selectores (no se enviará nada)...")
+        self.detect_btn.configure(state="disabled")
+        threading.Thread(target=self._run_detect_only, args=(self.current_task_id,), daemon=True).start()
+
+    def _run_detect_only(self, task_id: str):
+        cmd = _runner_command(task_id, "--detect-only")
+        result = subprocess.run(
+            cmd, cwd=os.path.dirname(cmd[0]), capture_output=True, text=True,
+        )
+        ok = result.returncode == 0
+        message = "✓ Se encontraron los campos de usuario y contraseña." if ok else (
+            "✗ No se encontraron todos los campos. Revisa el log para ver el detalle "
+            "y ajusta los selectores CSS en Avanzado si hace falta."
+        )
+        self.after(0, lambda: self._detect_only_done(ok, message))
+
+    def _detect_only_done(self, ok: bool, message: str):
+        self.detect_btn.configure(state="normal")
+        self._refresh_log_button()
+        self.status_label.configure(style="Success.TLabel" if ok else "Danger.TLabel")
+        self.status_var.set(message)
+        if not ok:
+            messagebox.showwarning("Resultado de la detección", message)
 
 
 if __name__ == "__main__":

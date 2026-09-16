@@ -1,6 +1,10 @@
 """Abre la URL de una tarea guardada e inicia sesión con sus credenciales.
 
-Uso: python run_login.py <task_id> [--no-keep-alive]
+Uso: python run_login.py <task_id> [--no-keep-alive] [--detect-only]
+
+--detect-only navega a la URL y busca los campos de usuario/contraseña/botón
+sin rellenar ni enviar nada (para validar selectores sin arriesgar un
+bloqueo por intento de login fallido).
 
 Pensado para ejecutarse desde la GUI (botón "Probar ahora") o desde una
 tarea programada de Windows. Registra el resultado en logs/<task_id>.log y,
@@ -74,12 +78,28 @@ DIALOG_CONFIRM_CANDIDATES = [
 ]
 
 _LOG_FILE = None
+_MAX_LOG_BYTES = 2 * 1024 * 1024  # 2 MB
+_LOG_LINES_KEPT_ON_ROTATE = 2000
 
 
 def init_logging(task_id: str) -> None:
     global _LOG_FILE
     os.makedirs(config_store.LOG_DIR, exist_ok=True)
     _LOG_FILE = config_store.log_path(task_id)
+
+
+def _rotate_log_if_needed() -> None:
+    """Evita que el .log crezca sin límite: si supera ~2MB, se queda solo
+    con las últimas líneas."""
+    try:
+        if os.path.getsize(_LOG_FILE) <= _MAX_LOG_BYTES:
+            return
+        with open(_LOG_FILE, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+        with open(_LOG_FILE, "w", encoding="utf-8") as f:
+            f.writelines(lines[-_LOG_LINES_KEPT_ON_ROTATE:])
+    except OSError:
+        pass
 
 
 def log(message: str) -> None:
@@ -90,6 +110,8 @@ def log(message: str) -> None:
     except Exception:
         pass  # sin consola en el .exe empaquetado (--windowed): no hay stdout
     if _LOG_FILE:
+        if os.path.exists(_LOG_FILE):
+            _rotate_log_if_needed()
         with open(_LOG_FILE, "a", encoding="utf-8") as f:
             f.write(line + "\n")
 
@@ -176,6 +198,35 @@ def ensure_chromium_installed() -> bool:
     except Exception as exc:
         log(f"No se pudo instalar Chromium automáticamente: {exc}")
         return False
+
+
+def backoff_wait(attempt: int, base: float = 5, cap: float = 60) -> None:
+    """Espera progresiva entre reintentos (5s, 10s, 20s, ... hasta `cap`)."""
+    time.sleep(min(base * (2 ** (attempt - 1)), cap))
+
+
+def detect_only(page, cfg: dict) -> str:
+    """Navega a la URL e intenta localizar los campos de login SIN rellenar
+    ni enviar nada. Sirve para validar los selectores de una tarea nueva sin
+    arriesgarse a un bloqueo por intento de login fallido."""
+    log(f"Abriendo {cfg['url']} (solo detección, no se enviará ningún dato)")
+    page.goto(cfg["url"], wait_until="load", timeout=30000)
+
+    user_field, user_sel = find_first(page, cfg.get("user_selector", ""), USER_SELECTOR_CANDIDATES)
+    log(f"Campo usuario: {'encontrado (' + user_sel + ')' if user_field else 'NO encontrado'}")
+
+    pass_field, pass_sel = find_first(page, cfg.get("pass_selector", ""), PASS_SELECTOR_CANDIDATES)
+    log(f"Campo contraseña: {'encontrado (' + pass_sel + ')' if pass_field else 'NO encontrado'}")
+
+    submit_btn, submit_sel = find_first(
+        page, cfg.get("submit_selector", ""), SUBMIT_SELECTOR_CANDIDATES, timeout_ms=3000
+    )
+    if submit_btn:
+        log(f"Botón de envío: encontrado ({submit_sel})")
+    else:
+        log("Botón de envío: no encontrado (se usaría Enter en su lugar)")
+
+    return "success" if (user_field and pass_field) else "failed"
 
 
 def perform_login(page, cfg: dict, expect_login_form: bool = True):
@@ -267,7 +318,6 @@ def keep_session_alive(page, cfg: dict, pass_sel: str | None) -> None:
     interval_min = max(1, cfg.get("keep_alive_interval_min", 5))
     duration_min = cfg.get("keep_alive_duration_min", 60)
     max_retries = 3
-    retry_wait_sec = 5
 
     if duration_min:
         log(f"Manteniendo la sesión activa: recarga cada {interval_min} min durante {duration_min} min.")
@@ -290,7 +340,7 @@ def keep_session_alive(page, cfg: dict, pass_sel: str | None) -> None:
                     log("Se detiene el mantenimiento de sesión: la pestaña se cerró.")
                     return
                 log(f"Intento {attempt}/{max_retries} de refresco falló ({exc}); reintentando...")
-                time.sleep(retry_wait_sec)
+                backoff_wait(attempt)
 
         if not refreshed:
             message = "No se pudo refrescar la sesión tras varios intentos; se detuvo el mantenimiento."
@@ -336,12 +386,13 @@ def keep_session_alive(page, cfg: dict, pass_sel: str | None) -> None:
 def main() -> int:
     if len(sys.argv) < 2:
         try:
-            print("Uso: python run_login.py <task_id> [--no-keep-alive]", file=sys.stderr)
+            print("Uso: python run_login.py <task_id> [--no-keep-alive] [--detect-only]", file=sys.stderr)
         except Exception:
             pass
         return 2
     task_id = sys.argv[1]
     no_keep_alive = "--no-keep-alive" in sys.argv[2:]
+    detect_only_mode = "--detect-only" in sys.argv[2:]
     init_logging(task_id)
 
     cfg = config_store.get_task(task_id)
@@ -373,6 +424,13 @@ def main() -> int:
         )
         page = context.new_page()
         try:
+            if detect_only_mode:
+                status = detect_only(page, cfg)
+                if status == "failed":
+                    page.screenshot(path=screenshot_path)
+                    log(f"Captura guardada en {screenshot_path}")
+                return 0 if status == "success" else 1
+
             # Reintenta el login inicial ante fallos de red/navegación (no ante
             # credenciales rechazadas, para no arriesgar bloqueos por reintentos).
             max_initial_retries = 3
@@ -390,7 +448,7 @@ def main() -> int:
                             f"Intento {attempt}/{max_initial_retries} de login falló por un error "
                             f"de red/navegación ({exc}); reintentando..."
                         )
-                        time.sleep(5)
+                        backoff_wait(attempt)
             if last_exc is not None:
                 raise last_exc
 
