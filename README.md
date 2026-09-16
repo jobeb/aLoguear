@@ -27,6 +27,9 @@ sesión activa (por ejemplo, campus virtuales de formación).
 - Visor de log integrado y modo "solo detección" (comprueba los selectores sin enviar
   ningún dato, para configurar un sitio nuevo sin arriesgarte a un bloqueo).
 - Rotación de logs y espera progresiva entre reintentos.
+- Sección de **Configuración** (⚙): arranque automático con Windows, activar/desactivar
+  notificaciones, elegir qué hace el botón de cerrar (bandeja o salir), tamaño máximo de
+  log y carpeta donde se guardan los datos.
 
 ## Requisitos
 

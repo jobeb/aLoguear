@@ -8,15 +8,61 @@ import base64
 import datetime
 import json
 import os
+import shutil
 import uuid
 
 import crypto_utils
 
-CONFIG_DIR = os.path.join(os.environ["LOCALAPPDATA"], "AutoLogin")
+# La carpeta de datos por defecto es fija; si el usuario la cambia desde
+# Configuración, la ubicación real se guarda en un archivo puntero dentro de
+# esta carpeta por defecto (para poder encontrarla aunque se haya movido).
+DEFAULT_CONFIG_DIR = os.path.join(os.environ["LOCALAPPDATA"], "AutoLogin")
+_LOCATION_POINTER_PATH = os.path.join(DEFAULT_CONFIG_DIR, "location.txt")
+
+
+def _resolve_config_dir() -> str:
+    try:
+        if os.path.exists(_LOCATION_POINTER_PATH):
+            with open(_LOCATION_POINTER_PATH, "r", encoding="utf-8") as f:
+                custom = f.read().strip()
+            if custom and os.path.isdir(custom):
+                return custom
+    except OSError:
+        pass
+    return DEFAULT_CONFIG_DIR
+
+
+CONFIG_DIR = _resolve_config_dir()
 TASKS_PATH = os.path.join(CONFIG_DIR, "tasks.json")
 LOG_DIR = os.path.join(CONFIG_DIR, "logs")
 SETTINGS_PATH = os.path.join(CONFIG_DIR, "settings.json")
 _OLD_CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+
+
+def get_config_dir() -> str:
+    return CONFIG_DIR
+
+
+def set_config_dir(new_dir: str) -> None:
+    """Copia todos los datos (tareas, logs, ajustes) a `new_dir` y recuerda la
+    ubicación mediante un archivo puntero en la carpeta por defecto. El
+    proceso actual sigue usando la ruta antigua: hace falta reiniciar la app
+    para que tenga efecto."""
+    new_dir = os.path.abspath(new_dir)
+    os.makedirs(new_dir, exist_ok=True)
+    if os.path.isdir(CONFIG_DIR) and os.path.abspath(CONFIG_DIR) != new_dir:
+        for name in os.listdir(CONFIG_DIR):
+            if name == "location.txt":
+                continue
+            src = os.path.join(CONFIG_DIR, name)
+            dst = os.path.join(new_dir, name)
+            if os.path.isdir(src):
+                shutil.copytree(src, dst, dirs_exist_ok=True)
+            else:
+                shutil.copy2(src, dst)
+    os.makedirs(DEFAULT_CONFIG_DIR, exist_ok=True)
+    with open(_LOCATION_POINTER_PATH, "w", encoding="utf-8") as f:
+        f.write(new_dir)
 
 
 def load_settings() -> dict:

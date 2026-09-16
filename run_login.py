@@ -78,7 +78,7 @@ DIALOG_CONFIRM_CANDIDATES = [
 ]
 
 _LOG_FILE = None
-_MAX_LOG_BYTES = 2 * 1024 * 1024  # 2 MB
+_DEFAULT_MAX_LOG_MB = 2
 _LOG_LINES_KEPT_ON_ROTATE = 2000
 
 
@@ -89,10 +89,13 @@ def init_logging(task_id: str) -> None:
 
 
 def _rotate_log_if_needed() -> None:
-    """Evita que el .log crezca sin límite: si supera ~2MB, se queda solo
-    con las últimas líneas."""
+    """Evita que el .log crezca sin límite: si supera el tamaño configurado
+    (por defecto 2MB, ajustable en Configuración), se queda solo con las
+    últimas líneas."""
     try:
-        if os.path.getsize(_LOG_FILE) <= _MAX_LOG_BYTES:
+        max_mb = config_store.load_settings().get("log_max_mb", _DEFAULT_MAX_LOG_MB)
+        max_bytes = max(1, max_mb) * 1024 * 1024
+        if os.path.getsize(_LOG_FILE) <= max_bytes:
             return
         with open(_LOG_FILE, "r", encoding="utf-8", errors="ignore") as f:
             lines = f.readlines()
@@ -165,6 +168,8 @@ def collect_error_hints(page) -> str:
 def notify_failure(cfg: dict, message: str) -> None:
     """Muestra una notificación de Windows. No debe romper la ejecución si falla."""
     if _toast is None:
+        return
+    if not config_store.load_settings().get("notifications_enabled", True):
         return
     try:
         _toast(f"AutoLogin: {cfg.get('name', cfg.get('url', ''))}", message, duration="long")

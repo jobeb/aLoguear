@@ -120,6 +120,47 @@ def _detect_windows_dark_mode() -> bool:
         return False
 
 
+# --- Arranque automático con Windows (HKCU\...\Run) ---
+
+_STARTUP_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_STARTUP_VALUE_NAME = "aLoguear"
+
+
+def _startup_command() -> str:
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}" --start-minimized'
+    script = os.path.abspath(__file__)
+    pythonw = sys.executable
+    candidate = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    if os.path.exists(candidate):
+        pythonw = candidate
+    return f'"{pythonw}" "{script}" --start-minimized'
+
+
+def is_startup_enabled() -> bool:
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _STARTUP_REG_PATH) as key:
+            winreg.QueryValueEx(key, _STARTUP_VALUE_NAME)
+        return True
+    except Exception:
+        return False
+
+
+def set_startup_enabled(enabled: bool) -> None:
+    import winreg
+    with winreg.OpenKey(
+        winreg.HKEY_CURRENT_USER, _STARTUP_REG_PATH, 0, winreg.KEY_SET_VALUE
+    ) as key:
+        if enabled:
+            winreg.SetValueEx(key, _STARTUP_VALUE_NAME, 0, winreg.REG_SZ, _startup_command())
+        else:
+            try:
+                winreg.DeleteValue(key, _STARTUP_VALUE_NAME)
+            except FileNotFoundError:
+                pass
+
+
 def _apply_palette(dark: bool) -> None:
     global BG, CARD_BG, INNER_BG, BORDER, TEXT, MUTED, ACCENT, ACCENT_DARK, ACCENT_LIGHT
     global SUCCESS, DANGER, DANGER_LIGHT, SECONDARY_BG, SECONDARY_HOVER, SECONDARY_PRESS
@@ -781,7 +822,8 @@ class App(tk.Tk):
     # --- Bandeja del sistema ---
 
     def _on_close_button(self):
-        if pystray is not None:
+        close_action = config_store.load_settings().get("close_action", "tray")
+        if pystray is not None and close_action == "tray":
             self._minimize_to_tray()
         else:
             self.destroy()
@@ -973,6 +1015,105 @@ class App(tk.Tk):
                 card, text=label, value=value, variable=theme_var,
                 command=lambda v=value: _pick(v), style="Card.TRadiobutton",
             ).pack(anchor="w", pady=2)
+
+        # --- Comportamiento ---
+        settings = config_store.load_settings()
+        behavior_card = ttk.Labelframe(
+            body, text="  Comportamiento  ", style="Card.TLabelframe", padding=12
+        )
+        behavior_card.pack(fill="x", pady=(12, 0))
+
+        startup_var = tk.BooleanVar(value=is_startup_enabled())
+
+        def _toggle_startup():
+            try:
+                set_startup_enabled(startup_var.get())
+            except Exception as exc:
+                messagebox.showerror(
+                    "No se pudo cambiar el arranque automático",
+                    f"No se pudo actualizar el registro de Windows:\n{exc}",
+                )
+                startup_var.set(is_startup_enabled())
+
+        ttk.Checkbutton(
+            behavior_card, text="Iniciar con Windows (minimizada en la bandeja)",
+            variable=startup_var, style="Card.TCheckbutton", command=_toggle_startup,
+        ).pack(anchor="w", pady=2)
+
+        notif_var = tk.BooleanVar(value=settings.get("notifications_enabled", True))
+        ttk.Checkbutton(
+            behavior_card, text="Notificaciones de Windows si falla una tarea",
+            variable=notif_var, style="Card.TCheckbutton",
+            command=lambda: config_store.save_settings({"notifications_enabled": notif_var.get()}),
+        ).pack(anchor="w", pady=2)
+
+        ttk.Label(behavior_card, text="Al cerrar la ventana (✕)", style="Card.TLabel").pack(
+            anchor="w", pady=(8, 2)
+        )
+        close_var = tk.StringVar(value=settings.get("close_action", "tray"))
+        for value, label in (
+            ("tray", "Minimizar a la bandeja del sistema"),
+            ("exit", "Salir de la app"),
+        ):
+            ttk.Radiobutton(
+                behavior_card, text=label, value=value, variable=close_var,
+                style="Card.TRadiobutton",
+                command=lambda: config_store.save_settings({"close_action": close_var.get()}),
+            ).pack(anchor="w", pady=2)
+
+        # --- Datos ---
+        data_card = ttk.Labelframe(body, text="  Datos  ", style="Card.TLabelframe", padding=12)
+        data_card.pack(fill="x", pady=(12, 0))
+
+        ttk.Label(data_card, text="Tamaño máximo de cada log (MB)", style="Card.TLabel").pack(
+            anchor="w", pady=(0, 4)
+        )
+        def _save_log_mb(*_args):
+            try:
+                config_store.save_settings({"log_max_mb": int(log_mb_var.get() or 2)})
+            except ValueError:
+                pass
+
+        log_mb_var = tk.StringVar(value=str(settings.get("log_max_mb", 2)))
+        log_mb_row = ttk.Frame(data_card, style="Card.TFrame")
+        log_mb_row.pack(anchor="w", pady=(0, 10))
+        log_mb_spin = ttk.Spinbox(
+            log_mb_row, from_=1, to=50, width=5, textvariable=log_mb_var, command=_save_log_mb,
+        )
+        log_mb_spin.pack(side="left")
+        log_mb_spin.bind("<FocusOut>", _save_log_mb)
+        log_mb_spin.bind("<Return>", _save_log_mb)
+        ttk.Label(log_mb_row, text="MB", style="Card.TLabel").pack(side="left", padx=(6, 0))
+
+        ttk.Label(data_card, text="Carpeta de datos", style="Card.TLabel").pack(anchor="w", pady=(0, 4))
+        path_var = tk.StringVar(value=config_store.get_config_dir())
+        ttk.Entry(data_card, textvariable=path_var, state="readonly", width=42).pack(
+            anchor="w", pady=(0, 6)
+        )
+
+        def _change_folder():
+            new_dir = filedialog.askdirectory(
+                title="Elige la nueva carpeta para los datos de aLoguear",
+                initialdir=config_store.get_config_dir(),
+            )
+            if not new_dir:
+                return
+            try:
+                config_store.set_config_dir(new_dir)
+            except OSError as exc:
+                messagebox.showerror("No se pudo mover la carpeta", str(exc))
+                return
+            path_var.set(new_dir)
+            messagebox.showinfo(
+                "Carpeta cambiada",
+                f"Los datos se copiaron a:\n{new_dir}\n\n"
+                "Cierra y vuelve a abrir aLoguear para que la app empiece a usar "
+                "esa carpeta (los datos originales no se han borrado).",
+            )
+
+        ttk.Button(data_card, text="Cambiar carpeta...", style="Secondary.TButton", command=_change_folder).pack(
+            anchor="w"
+        )
 
         ttk.Button(body, text="Cerrar", style="Secondary.TButton", command=win.destroy).pack(
             anchor="e", pady=(14, 0)
@@ -1736,4 +1877,9 @@ class App(tk.Tk):
 
 
 if __name__ == "__main__":
-    App().mainloop()
+    app = App()
+    if "--start-minimized" in sys.argv[1:]:
+        app.withdraw()
+        if pystray is not None:
+            app._start_tray_icon()
+    app.mainloop()
