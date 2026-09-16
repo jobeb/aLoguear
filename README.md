@@ -22,7 +22,7 @@ sesión activa (por ejemplo, campus virtuales de formación).
 - Icono en la bandeja del sistema: cerrar la ventana la minimiza en vez de salir.
 - Comprobación de actualizaciones y, en la versión portable, actualización con un clic
   (descarga la nueva versión y se reemplaza sola).
-- Modo oscuro/claro automático según el tema de Windows.
+- Modo oscuro/claro (automático según Windows, o manual desde ⚙ Configuración).
 - Buscador y ordenación por columnas en la lista de tareas.
 - Visor de log integrado y modo "solo detección" (comprueba los selectores sin enviar
   ningún dato, para configurar un sitio nuevo sin arriesgarte a un bloqueo).

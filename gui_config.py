@@ -348,11 +348,21 @@ class App(tk.Tk):
         # --- Cabecera ---
         header = ttk.Frame(self, style="Header.TFrame")
         header.pack(fill="x")
-        header_row = ttk.Frame(header, style="Header.TFrame")
-        header_row.pack(anchor="w", padx=20, pady=(16, 0))
+        top_row = ttk.Frame(header, style="Header.TFrame")
+        top_row.pack(fill="x", padx=20, pady=(16, 0))
+
+        header_row = ttk.Frame(top_row, style="Header.TFrame")
+        header_row.pack(side="left")
         if self._logo_img is not None:
             ttk.Label(header_row, image=self._logo_img, style="Header.TFrame").pack(side="left", padx=(0, 10))
         ttk.Label(header_row, text=APP_NAME, style="Header.TLabel").pack(side="left")
+
+        settings_btn = ttk.Button(
+            top_row, text="⚙", style="HeaderIcon.TButton", width=3, command=self.open_settings
+        )
+        settings_btn.pack(side="right")
+        ToolTip(settings_btn, "Configuración de la app (tema claro/oscuro).")
+
         ttk.Label(
             header, text="Gestiona accesos web y prográmalos como tareas de Windows",
             style="SubHeader.TLabel"
@@ -382,6 +392,7 @@ class App(tk.Tk):
         self.scroll_container = scroll_container
 
         canvas = tk.Canvas(scroll_container, bg=BG, highlightthickness=0)
+        self.canvas = canvas
         scrollbar = ttk.Scrollbar(scroll_container, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=scrollbar.set)
         canvas.pack(side="left", fill="both", expand=True)
@@ -902,11 +913,78 @@ class App(tk.Tk):
 
     # --- Estilo ---
 
+    def _resolve_dark_mode(self, setting: str) -> bool:
+        if setting == "dark":
+            return True
+        if setting == "light":
+            return False
+        return _detect_windows_dark_mode()  # "auto" o valor desconocido
+
     def _setup_style(self):
-        self.is_dark = _detect_windows_dark_mode()
-        _apply_palette(self.is_dark)
+        self.theme_setting = config_store.load_settings().get("theme", "auto")
+        self.is_dark = self._resolve_dark_mode(self.theme_setting)
+        self._build_style()
         self._apply_titlebar_theme()
 
+    def set_theme(self, setting: str):
+        """Cambia el tema en caliente (sin reiniciar) y lo recuerda para la
+        próxima vez que se abra la app."""
+        self.theme_setting = setting
+        config_store.save_settings({"theme": setting})
+        self.is_dark = self._resolve_dark_mode(setting)
+        self._build_style()
+        self._apply_titlebar_theme()
+        self.configure(bg=BG)
+        if getattr(self, "canvas", None) is not None:
+            self.canvas.configure(bg=BG)
+        if getattr(self, "tree", None) is not None:
+            self.tree.tag_configure("fail_row", background=DANGER_LIGHT)
+            self.tree.tag_configure("paused_row", foreground=MUTED)
+
+    def open_settings(self):
+        win = tk.Toplevel(self)
+        win.title("Configuración")
+        win.resizable(False, False)
+        win.configure(bg=BG)
+        win.transient(self)
+
+        body = ttk.Frame(win, style="TFrame", padding=16)
+        body.pack(fill="both", expand=True)
+
+        card = ttk.Labelframe(body, text="  Apariencia  ", style="Card.TLabelframe", padding=12)
+        card.pack(fill="x")
+
+        ttk.Label(card, text="Tema", style="Card.TLabel").pack(anchor="w", pady=(0, 6))
+
+        theme_var = tk.StringVar(value=getattr(self, "theme_setting", "auto"))
+
+        def _pick(value):
+            theme_var.set(value)
+            self.set_theme(value)
+            win.configure(bg=BG)
+            body.configure(style="TFrame")
+
+        for value, label in (
+            ("auto", "Automático (según Windows)"),
+            ("light", "Claro"),
+            ("dark", "Oscuro"),
+        ):
+            ttk.Radiobutton(
+                card, text=label, value=value, variable=theme_var,
+                command=lambda v=value: _pick(v), style="Card.TRadiobutton",
+            ).pack(anchor="w", pady=2)
+
+        ttk.Button(body, text="Cerrar", style="Secondary.TButton", command=win.destroy).pack(
+            anchor="e", pady=(14, 0)
+        )
+
+        win.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - win.winfo_reqwidth()) // 2
+        y = self.winfo_rooty() + 60
+        win.geometry(f"+{x}+{y}")
+
+    def _build_style(self):
+        _apply_palette(self.is_dark)
         style = ttk.Style(self)
         try:
             style.theme_use("clam")
@@ -919,6 +997,12 @@ class App(tk.Tk):
         style.configure("Header.TFrame", background=ACCENT)
         style.configure("Header.TLabel", background=ACCENT, foreground="white", font=(FONT, 16, "bold"))
         style.configure("SubHeader.TLabel", background=ACCENT, foreground="#dffaf5", font=(FONT, 9))
+
+        style.configure(
+            "HeaderIcon.TButton", font=(FONT, 11), padding=(4, 2),
+            background=ACCENT, foreground="white", borderwidth=0, relief="flat"
+        )
+        style.map("HeaderIcon.TButton", background=[("active", ACCENT_DARK)])
 
         style.configure("UpdateBanner.TFrame", background="#fff7e0")
         style.configure("UpdateBanner.TLabel", background="#fff7e0", foreground="#8a6100", font=(FONT, 9, "bold"))
@@ -970,6 +1054,11 @@ class App(tk.Tk):
         )
         for st in ("TCheckbutton", "Card.TCheckbutton", "Day.TCheckbutton"):
             style.map(st, background=[("active", CARD_BG)], foreground=[("active", ACCENT)])
+
+        style.configure(
+            "Card.TRadiobutton", background=CARD_BG, foreground=TEXT, font=(FONT, 10)
+        )
+        style.map("Card.TRadiobutton", background=[("active", CARD_BG)], foreground=[("active", ACCENT)])
 
         style.configure(
             "TEntry", fieldbackground=INNER_BG, foreground=TEXT,

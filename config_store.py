@@ -15,7 +15,27 @@ import crypto_utils
 CONFIG_DIR = os.path.join(os.environ["LOCALAPPDATA"], "AutoLogin")
 TASKS_PATH = os.path.join(CONFIG_DIR, "tasks.json")
 LOG_DIR = os.path.join(CONFIG_DIR, "logs")
+SETTINGS_PATH = os.path.join(CONFIG_DIR, "settings.json")
 _OLD_CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+
+
+def load_settings() -> dict:
+    """Configuración general de la app (no por tarea), p.ej. el tema."""
+    if not os.path.exists(SETTINGS_PATH):
+        return {}
+    try:
+        with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_settings(data: dict) -> None:
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    current = load_settings()
+    current.update(data)
+    with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+        json.dump(current, f, indent=2)
 
 
 def _migrate_old_config() -> None:
