@@ -25,6 +25,16 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
+      - name: Check tag matches version.py
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}".TrimStart("vV")
+          $ver = (Select-String -Path version.py -Pattern '__version__\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          if ($tag -ne $ver) { throw "El tag ${{ github.ref_name }} no coincide con version.py ($ver)" }
+
+      - name: Sanity check (compileall)
+        run: python -m compileall -q gui_config.py run_login.py config_store.py crypto_utils.py version.py
+
       - name: Build GUI executable
         run: >
           pyinstaller --noconfirm --onefile --windowed --name aLoguear

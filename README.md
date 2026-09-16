@@ -76,6 +76,14 @@ python gui_config.py
 | `register_task.ps1` / `unregister_task.ps1` | Alta/baja de la tarea en el Programador de tareas de Windows. |
 | `list_next_runs.ps1` | Consulta la próxima ejecución programada de cada tarea. |
 
+## Notas de seguridad
+
+- Las tareas programadas usan `LogonType Interactive`: solo corren con tu sesión iniciada (exigencia de DPAPI).
+- La sesión reutilizada (`logs/*_session.json`) se guarda en claro: quien copie ese fichero hereda tu sesión.
+- Exportar con contraseñas las deja en texto plano: custodia ese `.json`.
+- La auto-actualización verifica el `.sha256` oficial y se bloquea si no coincide o si el release no lo publica.
+- Duración keep-alive `0:00` = indefinido: el runner queda vivo recargando y ocupa su tarea programada.
+
 ## Licencia
 
-Uso personal.
+MIT — ver `LICENSE`.

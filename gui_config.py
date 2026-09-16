@@ -4,6 +4,7 @@ programación), cada una registrable como su propia tarea programada de Windows.
 Guarda las tareas cifradas (DPAPI) en %LOCALAPPDATA%\\AutoLogin\\tasks.json.
 """
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -14,6 +15,7 @@ import tempfile
 import threading
 import tkinter as tk
 import urllib.error
+import urllib.parse
 import urllib.request
 import webbrowser
 import zipfile
@@ -43,12 +45,11 @@ def _parse_version(text: str) -> tuple:
     return tuple(int(p) for p in parts) or (0,)
 
 
-def check_for_update() -> tuple[str, str, str | None] | None:
+def check_for_update() -> tuple[str, str, str | None, str | None] | None:
     """Consulta el último release de GitHub. Devuelve (version, html_url,
-    asset_zip_url) si hay una versión más nueva que la instalada, o None (sin
-    release, sin conexión, o ya estamos al día). asset_zip_url puede ser None
-    si el release no trae un .zip portable adjunto. No debe lanzar excepciones
-    nunca."""
+    asset_zip_url, asset_sha256_url) si hay una versión más nueva que la
+    instalada, o None (sin release, sin conexión, o ya estamos al día).
+    No debe lanzar excepciones nunca."""
     try:
         req = urllib.request.Request(
             f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
@@ -62,13 +63,32 @@ def check_for_update() -> tuple[str, str, str | None] | None:
         if _parse_version(latest_tag) > _parse_version(APP_VERSION):
             html_url = data.get("html_url") or f"https://github.com/{GITHUB_REPO}/releases/latest"
             asset_url = None
+            sha_url = None
             for asset in data.get("assets", []):
-                if asset.get("name", "").endswith("-win64.zip"):
+                name = asset.get("name", "")
+                if name.endswith("-win64.zip"):
                     asset_url = asset.get("browser_download_url")
-                    break
-            return latest_tag, html_url, asset_url
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError, OSError):
+                elif name.endswith("-win64.zip.sha256"):
+                    sha_url = asset.get("browser_download_url")
+            return latest_tag, html_url, asset_url, sha_url
+    except Exception:
         pass
+    return None
+
+
+def _sha256_of_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _parse_sha256_file(text: str) -> str | None:
+    """Extrae el hash de un fichero .sha256 ('<hash>  <nombre>' o solo hash)."""
+    text = (text or "").strip().split()[0] if (text or "").strip() else ""
+    if re.fullmatch(r"[0-9a-fA-F]{64}", text or ""):
+        return text.lower()
     return None
 
 DAYS = [
@@ -383,6 +403,63 @@ def _runner_command(*args) -> list:
     return [sys.executable, os.path.join(script_dir, "run_login.py"), *args]
 
 
+def _runner_cwd() -> str:
+    """Directorio de trabajo correcto para el runner (el del proyecto/scripts,
+    no el del intérprete de Python)."""
+    return _script_dir_global()
+
+
+_TIME_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+_VALID_DAYS = {"Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"}
+
+
+def _normalize_schedule_time(value: str) -> str:
+    value = (value or "").strip()
+    if _TIME_RE.match(value):
+        return value
+    return "08:00"
+
+
+def _normalize_schedule_days(value) -> list:
+    if not isinstance(value, list):
+        return []
+    return [d for d in value if d in _VALID_DAYS]
+
+
+def _parse_int_safe(value: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        number = int(str(value or "").strip() or default)
+    except (ValueError, TypeError):
+        return default
+    return max(minimum, min(maximum, number))
+
+
+def _is_valid_url(url: str) -> bool:
+    try:
+        parsed = urllib.parse.urlparse(url.strip())
+        return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+    except Exception:
+        return False
+
+
+_DATE_SORT_RE = re.compile(r"(\d{2})/(\d{2})\s+(\d{2}):(\d{2})")
+
+
+def _date_sort_key(text: str) -> tuple:
+    """Clave cronológica para 'dd/mm HH:MM' (con posible icono ✓/✗ delante).
+    Lo que no parece fecha (—, Pausada, …) va al final/principio de forma estable."""
+    if not isinstance(text, str):
+        return (1, 0, 0, 0, 0)
+    m = _DATE_SORT_RE.search(text)
+    if not m:
+        return (1, 0, 0, 0, 0)
+    try:
+        day, month, hour, minute = map(int, m.groups())
+        return (0, month, day, hour, minute)
+    except ValueError:
+        return (1, 0, 0, 0, 0)
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -428,6 +505,7 @@ class App(tk.Tk):
         self.update_banner = ttk.Frame(self, style="UpdateBanner.TFrame")
         self._update_url = None
         self._update_asset_url = None
+        self._update_sha_url = None
         self.update_label = ttk.Label(self.update_banner, text="", style="UpdateBanner.TLabel")
         self.update_label.pack(side="left", padx=(16, 8), pady=6)
         self.update_now_btn = ttk.Button(
@@ -653,7 +731,9 @@ class App(tk.Tk):
         ToolTip(
             keep_alive_chk,
             "Tras iniciar sesión, recarga la página periódicamente para evitar que el "
-            "sitio cierre la sesión por inactividad (y reintenta el login si caduca).",
+            "sitio cierre la sesión por inactividad (y reintenta el login si caduca).\n"
+            "Ojo: duración 0:00 = indefinido, el runner queda vivo para siempre y ocupa "
+            "su tarea programada.",
         )
         frow += 1
         self._keep_alive_row = frow
@@ -899,9 +979,11 @@ class App(tk.Tk):
         if result:
             self.after(0, lambda: self._show_update_banner(*result))
 
-    def _show_update_banner(self, latest_version: str, url: str, asset_url: str | None):
+    def _show_update_banner(self, latest_version: str, url: str, asset_url: str | None,
+                              sha_url: str | None = None):
         self._update_url = url
         self._update_asset_url = asset_url
+        self._update_sha_url = sha_url
         self.update_label.configure(text=f"🔔  Hay una nueva versión disponible: {latest_version} (tienes {APP_VERSION})")
         can_self_update = getattr(sys, "frozen", False) and asset_url
         if can_self_update:
@@ -925,6 +1007,32 @@ class App(tk.Tk):
             )
             with urllib.request.urlopen(req, timeout=120) as resp, open(zip_path, "wb") as f:
                 shutil.copyfileobj(resp, f)
+
+            # Verificación SHA256: bloquea la instalación si no coincide.
+            expected_hash = None
+            sha_url = getattr(self, "_update_sha_url", None)
+            if sha_url:
+                try:
+                    sha_req = urllib.request.Request(
+                        sha_url, headers={"User-Agent": "aLoguear-updater"}
+                    )
+                    with urllib.request.urlopen(sha_req, timeout=30) as resp:
+                        expected_hash = _parse_sha256_file(resp.read().decode("utf-8", errors="ignore"))
+                except Exception as exc:
+                    raise RuntimeError(f"No se pudo obtener el hash SHA256 oficial: {exc}")
+                if not expected_hash:
+                    raise RuntimeError("El fichero .sha256 oficial no tiene un formato válido.")
+                actual_hash = _sha256_of_file(zip_path)
+                if actual_hash != expected_hash:
+                    raise RuntimeError(
+                        "El hash SHA256 descargado no coincide con el oficial. "
+                        "Se bloquea la actualización por seguridad."
+                    )
+            else:
+                raise RuntimeError(
+                    "Este release no publica fichero .sha256; por seguridad no se aplica "
+                    "la auto-actualización. Descárgala manual desde 'Ver novedades'."
+                )
 
             extract_dir = os.path.join(tmp_dir, "extracted")
             with zipfile.ZipFile(zip_path) as zf:
@@ -1431,8 +1539,8 @@ class App(tk.Tk):
 
         def sort_key(iid):
             value = self.tree.item(iid, "text") if col == "#0" else self.tree.set(iid, col)
-            # Para "Última/Próxima ejecución", ordena por el texto tras el icono/fecha
-            # igual que se muestra (orden alfabético es suficiente aquí).
+            if col in ("last", "next"):
+                return _date_sort_key(value if isinstance(value, str) else "")
             return value.lower() if isinstance(value, str) else value
 
         children.sort(key=sort_key, reverse=reverse)
@@ -1446,6 +1554,11 @@ class App(tk.Tk):
         if not selection:
             return
         task_id = selection[0]
+        if task_id == self.current_task_id:
+            # Ya es la tarea abierta (p.ej. reselección tras refrescar la
+            # lista al terminar Guardar/Probar): no recargar el formulario,
+            # o se perdería el mensaje de resultado que se acaba de mostrar.
+            return
         data = config_store.get_task(task_id)
         if not data:
             return
@@ -1509,9 +1622,13 @@ class App(tk.Tk):
         except (OSError, json.JSONDecodeError) as exc:
             messagebox.showerror("Error al importar", f"No se pudo leer el archivo:\n{exc}")
             return
-        tasks = data.get("tasks", [])
-        if not tasks:
+        tasks = data.get("tasks", []) if isinstance(data, dict) else []
+        if not isinstance(tasks, list) or not tasks:
             messagebox.showinfo("Nada que importar", "El archivo no contiene tareas.")
+            return
+        tasks = [t for t in tasks if isinstance(t, dict)]
+        if not tasks:
+            messagebox.showinfo("Nada que importar", "El archivo no contiene tareas válidas.")
             return
         if not messagebox.askyesno(
             "Importar tareas",
@@ -1522,32 +1639,49 @@ class App(tk.Tk):
             return
         imported = 0
         missing_password = 0
+        skipped = 0
         for entry in tasks:
+            url = str(entry.get("url", "") or "").strip()
+            if not url or not _is_valid_url(url):
+                skipped += 1
+                continue
             password = entry.get("password", "") or ""
+            if not isinstance(password, str):
+                password = str(password)
             if not password:
                 missing_password += 1
-            config_store.save_task(
-                task_id=None,
-                name=entry.get("name", "") or entry.get("url", "Tarea importada"),
-                url=entry.get("url", ""),
-                username=entry.get("username", ""),
-                password=password,
-                headless=entry.get("headless", True),
-                user_selector=entry.get("user_selector", ""),
-                pass_selector=entry.get("pass_selector", ""),
-                submit_selector=entry.get("submit_selector", ""),
-                schedule_time=entry.get("schedule_time", "08:00"),
-                schedule_days=entry.get("schedule_days") or [],
-                keep_alive=entry.get("keep_alive", False),
-                keep_alive_interval_min=entry.get("keep_alive_interval_min", 5),
-                keep_alive_duration_min=entry.get("keep_alive_duration_min", 60),
-                active=False,
-            )
+            try:
+                config_store.save_task(
+                    task_id=None,
+                    name=str(entry.get("name", "") or url)[:200],
+                    url=url,
+                    username=str(entry.get("username", "") or ""),
+                    password=password,
+                    headless=bool(entry.get("headless", True)),
+                    user_selector=str(entry.get("user_selector", "") or ""),
+                    pass_selector=str(entry.get("pass_selector", "") or ""),
+                    submit_selector=str(entry.get("submit_selector", "") or ""),
+                    schedule_time=_normalize_schedule_time(str(entry.get("schedule_time", "08:00"))),
+                    schedule_days=_normalize_schedule_days(entry.get("schedule_days")),
+                    keep_alive=bool(entry.get("keep_alive", False)),
+                    keep_alive_interval_min=_parse_int_safe(
+                        entry.get("keep_alive_interval_min", 5), 5, 1, 120
+                    ),
+                    keep_alive_duration_min=_parse_int_safe(
+                        entry.get("keep_alive_duration_min", 60), 60, 0, 24 * 60
+                    ),
+                    active=False,
+                )
+            except Exception:
+                skipped += 1
+                continue
             imported += 1
         self._refresh_task_list()
         message = f"Se importaron {imported} tarea(s), quedaron pausadas."
         if missing_password:
             message += f"\n{missing_password} no traían contraseña: complétala y pulsa Guardar."
+        if skipped:
+            message += f"\n{skipped} entrada(s) se omitieron por URL no válida o datos corruptos."
         messagebox.showinfo("Tareas importadas", message)
 
     def on_delete_task(self):
@@ -1733,11 +1867,30 @@ class App(tk.Tk):
         return [day_name for day_name, var in self.day_vars.items() if var.get()]
 
     def _schedule_time_str(self) -> str:
-        return f"{int(self.hour_var.get()):02d}:{int(self.minute_var.get()):02d}"
+        hour = _parse_int_safe(self.hour_var.get(), 8, 0, 23)
+        minute = _parse_int_safe(self.minute_var.get(), 0, 0, 59)
+        self.hour_var.set(f"{hour:02d}")
+        self.minute_var.set(f"{minute:02d}")
+        return f"{hour:02d}:{minute:02d}"
+
+    def _keep_alive_values(self) -> tuple[int, int]:
+        interval = _parse_int_safe(self.keep_alive_interval_var.get(), 5, 1, 120)
+        hours = _parse_int_safe(self.keep_alive_duration_hour_var.get(), 1, 0, 23)
+        minutes = _parse_int_safe(self.keep_alive_duration_min_var.get(), 0, 0, 59)
+        self.keep_alive_interval_var.set(str(interval))
+        self.keep_alive_duration_hour_var.set(f"{hours:02d}")
+        self.keep_alive_duration_min_var.set(f"{minutes:02d}")
+        return interval, hours * 60 + minutes
 
     def _validate(self) -> bool:
-        if not self.url_var.get().strip():
+        url = self.url_var.get().strip()
+        if not url:
             messagebox.showerror("Falta la URL", "Introduce la URL de la página.")
+            return False
+        if not _is_valid_url(url):
+            messagebox.showerror(
+                "URL no válida", "Introduce una URL completa http(s)://, p.ej. https://ejemplo.com/login."
+            )
             return False
         if not self.user_var.get().strip():
             messagebox.showerror("Falta el usuario", "Introduce el usuario.")
@@ -1748,32 +1901,49 @@ class App(tk.Tk):
         if not self._selected_days():
             messagebox.showerror("Sin días seleccionados", "Elige al menos un día de la semana.")
             return False
+        try:
+            self._schedule_time_str()
+            self._keep_alive_values()
+        except Exception:
+            messagebox.showerror("Hora no válida", "Revisa la hora y los valores de keep-alive.")
+            return False
         return True
 
     def _save(self) -> bool:
         if not self._validate():
             return False
         name = self.name_var.get().strip() or self.url_var.get().strip()
-        task_id = config_store.save_task(
-            task_id=self.current_task_id,
-            name=name,
-            url=self.url_var.get().strip(),
-            username=self.user_var.get().strip(),
-            password=self.pass_var.get(),
-            headless=self.headless_var.get(),
-            user_selector=self.user_sel_var.get().strip(),
-            pass_selector=self.pass_sel_var.get().strip(),
-            submit_selector=self.submit_sel_var.get().strip(),
-            schedule_time=self._schedule_time_str(),
-            schedule_days=self._selected_days(),
-            keep_alive=self.keep_alive_var.get(),
-            keep_alive_interval_min=int(self.keep_alive_interval_var.get() or 5),
-            keep_alive_duration_min=(
-                int(self.keep_alive_duration_hour_var.get() or 0) * 60
-                + int(self.keep_alive_duration_min_var.get() or 0)
-            ),
-            active=self.active_var.get(),
-        )
+        interval_min, duration_min = self._keep_alive_values()
+        if self.keep_alive_var.get() and duration_min == 0:
+            proceed = messagebox.askyesno(
+                "Mantener sesión indefinidamente",
+                "Has puesto 0:00 (= indefinido): el proceso del runner quedará vivo "
+                "para siempre recargando la página y ocupará su tarea programada.\n\n"
+                "¿Seguro que quieres guardarlo así?",
+            )
+            if not proceed:
+                return False
+        try:
+            task_id = config_store.save_task(
+                task_id=self.current_task_id,
+                name=name,
+                url=self.url_var.get().strip(),
+                username=self.user_var.get().strip(),
+                password=self.pass_var.get(),
+                headless=self.headless_var.get(),
+                user_selector=self.user_sel_var.get().strip(),
+                pass_selector=self.pass_sel_var.get().strip(),
+                submit_selector=self.submit_sel_var.get().strip(),
+                schedule_time=self._schedule_time_str(),
+                schedule_days=self._selected_days(),
+                keep_alive=self.keep_alive_var.get(),
+                keep_alive_interval_min=interval_min,
+                keep_alive_duration_min=duration_min,
+                active=self.active_var.get(),
+            )
+        except Exception as exc:
+            messagebox.showerror("No se pudo guardar", f"No se pudo guardar la tarea:\n{exc}")
+            return False
         self.current_task_id = task_id
         self.name_var.set(name)
         self._refresh_task_list(select_id=task_id)
@@ -1841,7 +2011,7 @@ class App(tk.Tk):
     def _run_test(self, task_id: str):
         cmd = _runner_command(task_id, "--no-keep-alive")
         result = subprocess.run(
-            cmd, cwd=os.path.dirname(cmd[0]), capture_output=True, text=True,
+            cmd, cwd=_runner_cwd(), capture_output=True, text=True,
         )
         ok = result.returncode == 0
         message = "✓ Login ejecutado correctamente." if ok else (
@@ -1873,7 +2043,7 @@ class App(tk.Tk):
     def _run_detect_only(self, task_id: str):
         cmd = _runner_command(task_id, "--detect-only")
         result = subprocess.run(
-            cmd, cwd=os.path.dirname(cmd[0]), capture_output=True, text=True,
+            cmd, cwd=_runner_cwd(), capture_output=True, text=True,
         )
         ok = result.returncode == 0
         message = "✓ Se encontraron los campos de usuario y contraseña." if ok else (

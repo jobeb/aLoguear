@@ -32,6 +32,8 @@ def _bytes_to_blob(data: bytes) -> DATA_BLOB:
 
 def protect(plaintext: str) -> bytes:
     """Cifra una cadena de texto con DPAPI (ámbito: usuario actual)."""
+    if not plaintext:
+        raise ValueError("No se puede cifrar una cadena vacía")
     data = plaintext.encode("utf-8")
     in_blob = _bytes_to_blob(data)
     out_blob = DATA_BLOB()

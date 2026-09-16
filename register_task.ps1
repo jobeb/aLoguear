@@ -55,12 +55,21 @@ if ($RunnerExe) {
     }
     $action = New-ScheduledTaskAction -Execute $RunnerExe -Argument "`"$TaskId`"" -WorkingDirectory (Split-Path $RunnerExe)
 } else {
-    # Resuelve la ruta real del intérprete de Python a través del lanzador "py",
-    # ya que python.exe no siempre está en el PATH del sistema.
+    # Resuelve la ruta real del intérprete de Python: primero el lanzador "py"
+    # y, si no existe (Store Python, PATH directo...), python.exe del PATH.
     $runScript = Join-Path $scriptDir "run_login.py"
-    $pythonExe = & py -c "import sys; print(sys.executable)"
+    $pythonExe = ""
+    try {
+        $pythonExe = (& py -c "import sys; print(sys.executable)" 2>$null | Select-Object -First 1).Trim()
+    } catch {
+        $pythonExe = ""
+    }
     if (-not $pythonExe -or -not (Test-Path $pythonExe)) {
-        throw "No se pudo resolver python.exe mediante el lanzador 'py'. Instala Python o ajusta este script."
+        $cmd = Get-Command python.exe -ErrorAction SilentlyContinue
+        if ($cmd) { $pythonExe = $cmd.Source }
+    }
+    if (-not $pythonExe -or -not (Test-Path $pythonExe)) {
+        throw "No se pudo resolver python.exe (ni con el lanzador 'py' ni en el PATH). Instala Python o ajusta este script."
     }
     # Usa pythonw.exe (sin consola) si está disponible junto a python.exe
     $pythonwExe = Join-Path (Split-Path $pythonExe) "pythonw.exe"

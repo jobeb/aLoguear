@@ -21,14 +21,19 @@ import os
 import subprocess
 import sys
 import time
+import traceback
 
 # Debe fijarse ANTES de importar playwright: en el .exe empaquetado (PyInstaller),
 # Playwright resuelve la carpeta de navegadores de forma relativa a la carpeta
 # temporal de extracción en vez de la caché habitual, y no encuentra el Chromium
 # ya descargado con "playwright install". Forzamos siempre la ruta estándar.
-os.environ.setdefault(
-    "PLAYWRIGHT_BROWSERS_PATH", os.path.join(os.environ.get("LOCALAPPDATA", ""), "ms-playwright")
-)
+def _default_browsers_path() -> str:
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    return os.path.join(base, "ms-playwright")
+
+
+if not os.environ.get("PLAYWRIGHT_BROWSERS_PATH"):
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = _default_browsers_path()
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError, Error as PlaywrightError
 
@@ -128,6 +133,13 @@ def find_first(page, explicit_selector: str, candidates: list[str], timeout_ms: 
             return locator, selector
         except PlaywrightTimeoutError:
             continue
+        except PlaywrightError as exc:
+            # Selector CSS inválido u otro error de sintaxis: no reintentar
+            # el resto como si fuera "no encontrado", avisar en el log.
+            log(f"Selector no válido '{selector}': {exc}")
+            if explicit_selector:
+                return None, None
+            continue
     return None, None
 
 
@@ -178,22 +190,14 @@ def notify_failure(cfg: dict, message: str) -> None:
 
 
 def ensure_chromium_installed() -> bool:
-    """Descarga Chromium de Playwright si aún no está instalado (misma acción
-    que 'playwright install chromium' desde la terminal). El .exe empaquetado
-    no tiene esa CLI disponible en el PATH, así que invocamos directamente el
-    driver que Playwright ya trae dentro del propio paquete. Devuelve True si
-    quedó instalado (o ya lo estaba)."""
+    """Descarga Chromium de Playwright si aún no está instalado (equivale a
+    'playwright install chromium'). Usa 'python -m playwright' (API pública y
+    estable entre versiones) en vez de internos de playwright._impl."""
     try:
-        from playwright._impl._driver import compute_driver_executable, get_driver_env
-    except Exception as exc:
-        log(f"No se pudo localizar el instalador de Playwright: {exc}")
-        return False
-    try:
-        node, cli = compute_driver_executable()
         log("Chromium no está instalado; descargándolo (puede tardar uno o dos minutos)...")
         result = subprocess.run(
-            [node, cli, "install", "chromium"],
-            env=get_driver_env(), capture_output=True, text=True, timeout=600,
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            capture_output=True, text=True, timeout=600,
         )
         if result.returncode != 0:
             log(f"La descarga de Chromium terminó con errores: {(result.stderr or result.stdout).strip()}")
@@ -295,9 +299,19 @@ def perform_login(page, cfg: dict, expect_login_form: bool = True):
             except PlaywrightTimeoutError:
                 pass
 
+        # En SPAs el formulario puede tardar en desaparecer tras un envío
+        # correcto: espera explícita a que el campo de contraseña se oculte
+        # antes de decidir entre éxito/fracaso (evita falsos positivos).
         still_on_login = False
         if pass_sel:
-            still_on_login = page.locator(pass_sel).first.is_visible()
+            try:
+                page.locator(pass_sel).first.wait_for(state="hidden", timeout=4000)
+                still_on_login = False
+            except PlaywrightTimeoutError:
+                try:
+                    still_on_login = page.locator(pass_sel).first.is_visible()
+                except PlaywrightError:
+                    still_on_login = False
 
         if still_on_login:
             return "failed", pass_sel
@@ -486,11 +500,18 @@ def main() -> int:
                 return 0
 
             if cfg.get("keep_alive") and not no_keep_alive:
+                if not cfg.get("keep_alive_duration_min", 60):
+                    log("AVISO: keep-alive indefinido (0:00): este proceso quedará vivo "
+                        "recargando la página hasta que se detenga la tarea programada.")
                 keep_session_alive(page, cfg, pass_sel)
             config_store.save_last_result(task_id, True, "Login completado correctamente.")
             return 0
         except Exception as exc:
             log(f"ERROR inesperado: {exc}")
+            try:
+                log(traceback.format_exc().strip())
+            except Exception:
+                pass
             try:
                 if not page.is_closed():
                     page.screenshot(path=screenshot_path)
