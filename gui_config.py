@@ -355,13 +355,13 @@ class App(tk.Tk):
         list_btns.grid(row=0, column=0, sticky="e")
 
         export_btn = ttk.Button(
-            list_btns, text="⬆", style="IconGhost.TButton", width=3, command=self.on_export_tasks
+            list_btns, text="Exportar", style="IconGhost.TButton", command=self.on_export_tasks
         )
         export_btn.pack(side="left", padx=(0, 6))
         ToolTip(export_btn, "Exportar todas las tareas a un archivo (para respaldo o mover a otro equipo).")
 
         import_btn = ttk.Button(
-            list_btns, text="⬇", style="IconGhost.TButton", width=3, command=self.on_import_tasks
+            list_btns, text="Importar", style="IconGhost.TButton", command=self.on_import_tasks
         )
         import_btn.pack(side="left", padx=(0, 6))
         ToolTip(import_btn, "Importar tareas desde un archivo exportado antes.")
