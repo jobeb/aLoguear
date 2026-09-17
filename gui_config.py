@@ -225,15 +225,23 @@ def _apply_palette(dark: bool) -> None:
 
 _EXPORT_FIELDS = [
     "name", "url", "username", "headless", "user_selector", "pass_selector",
-    "submit_selector", "schedule_time", "schedule_days", "keep_alive",
+    "submit_selector", "schedule_time", "schedule_days",
+    "schedule_start_date", "schedule_end_date", "keep_alive",
     "keep_alive_interval_min", "keep_alive_duration_min", "active",
 ]
 
 # Espera a que este proceso (aLoguear.exe) termine, copia los archivos nuevos
 # encima de los actuales (reintentando mientras el .exe siga bloqueado) y
 # vuelve a abrir la app. Se lanza desprendido justo antes de cerrar la app.
+# Todo queda registrado en update.log junto al .exe; si la copia fracasa se
+# crea update.failed para avisar en el próximo arranque (nada es silencioso).
 _UPDATE_BAT_TEMPLATE = """@echo off
-setlocal
+setlocal EnableDelayedExpansion
+
+set "ULOG={log}"
+set "UFLAG={flag}"
+
+echo [%date% %time%] Actualizador iniciado. Esperando fin del proceso {pid}... > "%ULOG%"
 
 :waitloop
 tasklist /FI "PID eq {pid}" 2>nul | find "{pid}" >nul
@@ -241,28 +249,55 @@ if not errorlevel 1 (
     timeout /t 1 /nobreak >nul
     goto waitloop
 )
+echo [%date% %time%] Proceso terminado. Copiando archivos... >> "%ULOG%"
 
 set RETRIES=0
 :copyloop
-copy /y "{src}\\aLoguear.exe" "{dest}\\aLoguear.exe" >nul 2>&1
+copy /y "{src}\\aLoguear.exe" "{dest}\\aLoguear.exe" >> "%ULOG%" 2>&1
 if errorlevel 1 (
     set /a RETRIES+=1
-    if %RETRIES% GEQ 15 goto giveup
+    echo [%date% %time%] aLoguear.exe bloqueado, reintento !RETRIES!/{retries}... >> "%ULOG%"
+    if !RETRIES! GEQ {retries} goto giveup
     timeout /t 1 /nobreak >nul
     goto copyloop
 )
 
-copy /y "{src}\\aLoguear-runner.exe" "{dest}\\aLoguear-runner.exe" >nul 2>&1
-copy /y "{src}\\register_task.ps1" "{dest}\\register_task.ps1" >nul 2>&1
-copy /y "{src}\\unregister_task.ps1" "{dest}\\unregister_task.ps1" >nul 2>&1
-copy /y "{src}\\list_next_runs.ps1" "{dest}\\list_next_runs.ps1" >nul 2>&1
+copy /y "{src}\\aLoguear-runner.exe" "{dest}\\aLoguear-runner.exe" >> "%ULOG%" 2>&1
+if errorlevel 1 echo [%date% %time%] AVISO: no se pudo copiar aLoguear-runner.exe (puede estar en uso por una tarea). >> "%ULOG%"
+copy /y "{src}\\register_task.ps1" "{dest}\\register_task.ps1" >> "%ULOG%" 2>&1
+copy /y "{src}\\unregister_task.ps1" "{dest}\\unregister_task.ps1" >> "%ULOG%"
+copy /y "{src}\\list_next_runs.ps1" "{dest}\\list_next_runs.ps1" >> "%ULOG%" 2>&1
 
+echo [%date% %time%] Copia OK. Reiniciando la app... >> "%ULOG%"
+del "%UFLAG%" 2>nul
 start "" "{dest}\\aLoguear.exe"
 goto :eof
 
 :giveup
-start "" "{dest}\\aLoguear.exe"
+echo [%date% %time%] ERROR: no se pudo copiar aLoguear.exe tras {retries} intentos; no se aplica la actualizacion. >> "%ULOG%"
+echo error > "%UFLAG%"
 """
+
+_UPDATE_MAX_COPY_RETRIES = 30
+
+
+def _update_log_path() -> str:
+    """Ruta del registro del actualizador, junto al .exe instalado."""
+    return os.path.join(_script_dir_global(), "update.log")
+
+
+def _update_failed_flag_path() -> str:
+    """Fichero que deja el .bat si no pudo aplicar la actualización."""
+    return os.path.join(_script_dir_global(), "update.failed")
+
+
+def _read_update_log_tail(max_lines: int = 12) -> str:
+    try:
+        with open(_update_log_path(), "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+        return "".join(lines[-max_lines:]).strip()
+    except OSError:
+        return ""
 
 
 def _days_display(day_names: list) -> str:
@@ -442,6 +477,44 @@ def _is_valid_url(url: str) -> bool:
         return False
 
 
+_ISO_DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
+
+
+def _normalize_iso_date(value: str) -> str:
+    """Normaliza una fecha de vigencia a 'YYYY-MM-DD' o '' si vacía/inválida."""
+    value = (value or "").strip()
+    if not value:
+        return ""
+    if not _ISO_DATE_RE.match(value):
+        return ""
+    try:
+        datetime.date.fromisoformat(value)
+    except ValueError:
+        return ""
+    return value
+
+
+def _validity_display(start: str, end: str) -> str:
+    """Texto corto de vigencia para la lista: '—' si siempre vigente."""
+    start = (start or "").strip()
+    end = (end or "").strip()
+
+    def _short(iso: str) -> str:
+        try:
+            d = datetime.date.fromisoformat(iso)
+            return d.strftime("%d/%m/%y")
+        except ValueError:
+            return "?"
+
+    if not start and not end:
+        return "—"
+    if start and end:
+        return f"{_short(start)}→{_short(end)}"
+    if start:
+        return f"≥{_short(start)}"
+    return f"≤{_short(end)}"
+
+
 _DATE_SORT_RE = re.compile(r"(\d{2})/(\d{2})\s+(\d{2}):(\d{2})")
 
 
@@ -518,6 +591,7 @@ class App(tk.Tk):
             command=lambda: webbrowser.open(self._update_url) if self._update_url else None,
         ).pack(side="left")
         self.after(800, self._start_update_check)
+        self.after(1500, self._check_failed_update)
 
         # --- Contenedor con scroll (para que la ventana no dependa de caber
         #     entera en pantalla) ---
@@ -594,7 +668,7 @@ class App(tk.Tk):
         ToolTip(add_btn, "Limpia el formulario para crear una tarea nueva desde cero.")
 
         self.tree = ttk.Treeview(
-            list_card, columns=("time", "days", "last", "next"), show="tree headings", height=5,
+            list_card, columns=("time", "days", "validity", "last", "next"), show="tree headings", height=5,
             selectmode="browse", style="Card.Treeview"
         )
         self._sort_column = None
@@ -602,13 +676,15 @@ class App(tk.Tk):
         self.tree.heading("#0", text="Nombre", command=lambda: self._sort_tree("#0"))
         self.tree.heading("time", text="Hora", command=lambda: self._sort_tree("time"))
         self.tree.heading("days", text="Días", command=lambda: self._sort_tree("days"))
+        self.tree.heading("validity", text="Vigencia", command=lambda: self._sort_tree("validity"))
         self.tree.heading("last", text="Última ejecución", command=lambda: self._sort_tree("last"))
         self.tree.heading("next", text="Próxima ejecución", command=lambda: self._sort_tree("next"))
-        self.tree.column("#0", width=140, stretch=True)
+        self.tree.column("#0", width=130, stretch=True)
         self.tree.column("time", width=48, anchor="center", stretch=False)
-        self.tree.column("days", width=85, anchor="center", stretch=False)
-        self.tree.column("last", width=100, anchor="center", stretch=False)
-        self.tree.column("next", width=105, anchor="center", stretch=False)
+        self.tree.column("days", width=80, anchor="center", stretch=False)
+        self.tree.column("validity", width=95, anchor="center", stretch=False)
+        self.tree.column("last", width=95, anchor="center", stretch=False)
+        self.tree.column("next", width=100, anchor="center", stretch=False)
         self.tree.tag_configure("fail_row", background=DANGER_LIGHT)
         self.tree.tag_configure("paused_row", foreground=MUTED)
 
@@ -839,6 +915,25 @@ class App(tk.Tk):
                 days_frame, text=label, variable=var, style="Day.TCheckbutton"
             ).grid(row=0, column=i, padx=2)
 
+        ttk.Label(sched, text="Vigencia", style="Card.TLabel").grid(
+            row=2, column=0, sticky="nw", padx=(0, 8), pady=(10, 0)
+        )
+        validity_frame = ttk.Frame(sched, style="Card.TFrame")
+        validity_frame.grid(row=2, column=1, sticky="w", pady=(10, 0))
+        self.start_date_var = tk.StringVar(value="")
+        self.end_date_var = tk.StringVar(value="")
+        start_entry = ttk.Entry(validity_frame, textvariable=self.start_date_var, width=12)
+        start_entry.grid(row=0, column=0)
+        ToolTip(start_entry, "Fecha de inicio (YYYY-MM-DD). Vacío = sin límite.")
+        ttk.Label(validity_frame, text="→", style="Card.TLabel").grid(row=0, column=1, padx=5)
+        end_entry = ttk.Entry(validity_frame, textvariable=self.end_date_var, width=12)
+        end_entry.grid(row=0, column=2)
+        ToolTip(end_entry, "Fecha de fin (YYYY-MM-DD). Vacío = sin límite.")
+        ttk.Label(
+            validity_frame, text="YYYY-MM-DD, vacío = siempre vigente",
+            style="Muted.TLabel"
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
+
         # --- Guardar / Probar ---
         btn_frame = ttk.Frame(outer, style="TFrame")
         btn_frame.grid(row=row, column=0, pady=(0, 10))
@@ -1002,10 +1097,11 @@ class App(tk.Tk):
         try:
             tmp_dir = tempfile.mkdtemp(prefix="aloguear_update_")
             zip_path = os.path.join(tmp_dir, "update.zip")
+            self.after(0, lambda: self.update_now_btn.configure(text="Descargando..."))
             req = urllib.request.Request(
                 self._update_asset_url, headers={"User-Agent": "aLoguear-updater"}
             )
-            with urllib.request.urlopen(req, timeout=120) as resp, open(zip_path, "wb") as f:
+            with urllib.request.urlopen(req, timeout=600) as resp, open(zip_path, "wb") as f:
                 shutil.copyfileobj(resp, f)
 
             # Verificación SHA256: bloquea la instalación si no coincide.
@@ -1035,8 +1131,14 @@ class App(tk.Tk):
                 )
 
             extract_dir = os.path.join(tmp_dir, "extracted")
-            with zipfile.ZipFile(zip_path) as zf:
-                zf.extractall(extract_dir)
+            try:
+                with zipfile.ZipFile(zip_path) as zf:
+                    zf.extractall(extract_dir)
+            except zipfile.BadZipFile:
+                raise RuntimeError(
+                    "Lo descargado no es un .zip válido (¿corte de conexión?). "
+                    "Reinténtalo o descárgalo a mano desde 'Ver novedades'."
+                )
             if not os.path.exists(os.path.join(extract_dir, "aLoguear.exe")):
                 for name in os.listdir(extract_dir):
                     sub = os.path.join(extract_dir, name)
@@ -1045,17 +1147,39 @@ class App(tk.Tk):
                         break
                 else:
                     raise RuntimeError("El .zip descargado no contiene aLoguear.exe")
+            if not os.path.exists(os.path.join(extract_dir, "aLoguear-runner.exe")):
+                raise RuntimeError("El .zip descargado no contiene aLoguear-runner.exe")
 
             install_dir = os.path.dirname(sys.executable)
+            # Comprobación de escritura ANTES de cerrar la app: si no podemos
+            # escribir junto al .exe, avisamos ahora en vez de cerrar en vano.
+            try:
+                probe = os.path.join(install_dir, "update.write_test")
+                with open(probe, "w", encoding="utf-8") as f:
+                    f.write("ok")
+                os.remove(probe)
+            except OSError as exc:
+                raise RuntimeError(
+                    f"No hay permiso de escritura en la carpeta de instalación "
+                    f"({install_dir}): {exc}. Ejecuta la app como administrador "
+                    f"o descarga la nueva versión a mano desde 'Ver novedades'."
+                )
+
             bat_path = os.path.join(tmp_dir, "update.bat")
             with open(bat_path, "w", encoding="mbcs") as f:
                 f.write(_UPDATE_BAT_TEMPLATE.format(
                     pid=os.getpid(), src=extract_dir, dest=install_dir,
+                    log=_update_log_path(), flag=_update_failed_flag_path(),
+                    retries=_UPDATE_MAX_COPY_RETRIES,
                 ))
-            subprocess.Popen(
-                ["cmd.exe", "/c", bat_path],
-                creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
-            )
+            try:
+                subprocess.Popen(
+                    ["cmd.exe", "/c", bat_path],
+                    creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
+                )
+            except Exception as exc:
+                raise RuntimeError(f"No se pudo lanzar el instalador (update.bat): {exc}")
+            self.after(0, lambda: self.update_now_btn.configure(text="Instalando..."))
             self.after(0, self._quit_for_update)
         except Exception as exc:
             self.after(0, lambda: self._update_download_failed(str(exc)))
@@ -1066,7 +1190,21 @@ class App(tk.Tk):
                 self.tray_icon.stop()
             except Exception:
                 pass
-        self.destroy()
+            self.tray_icon = None
+        try:
+            self.destroy()
+        except Exception:
+            pass
+        # Red de seguridad: destroy() no siempre termina el proceso (un hilo
+        # o componente COM puede dejarlo colgado y entonces el .bat esperaría
+        # eternamente sin instalar nada). Este vigilante garantiza la salida.
+        threading.Thread(target=self._force_exit_watchdog, daemon=True).start()
+
+    @staticmethod
+    def _force_exit_watchdog():
+        import time as _time
+        _time.sleep(5)
+        os._exit(0)
 
     def _update_download_failed(self, message: str):
         self.update_now_btn.configure(state="normal", text="⬇  Actualizar ahora")
@@ -1075,6 +1213,33 @@ class App(tk.Tk):
             f"No se pudo descargar/aplicar la actualización automáticamente:\n{message}\n\n"
             "Puedes descargarla a mano desde 'Ver novedades'.",
         )
+
+    def _check_failed_update(self):
+        """Si el .bat de una actualización anterior dejó update.failed, avisa
+        con el registro y ofrece la descarga manual. (Antes estos fallos eran
+        totalmente silenciosos: la app se cerraba y no pasaba nada.)"""
+        try:
+            if not os.path.exists(_update_failed_flag_path()):
+                return
+        except Exception:
+            return
+        try:
+            os.remove(_update_failed_flag_path())
+        except OSError:
+            pass
+        detail = _read_update_log_tail(12)
+        message = (
+            "La actualización automática anterior no pudo aplicarse "
+            "(normalmente porque el .exe estaba bloqueado o el antivirus la interceptó).\n"
+            f"Tu versión actual sigue intacta: {APP_VERSION}.\n"
+        )
+        if detail:
+            message += f"\nRegistro del instalador (update.log):\n{detail}\n"
+        else:
+            message += "\nNo hay registro (update.log) con más detalle.\n"
+        message += "\n¿Abrir la página de descargas para actualizar a mano?"
+        if messagebox.askyesno("Actualización no aplicada", message):
+            webbrowser.open(f"https://github.com/{GITHUB_REPO}/releases/latest")
 
     # --- Estilo ---
 
@@ -1485,6 +1650,10 @@ class App(tk.Tk):
                 values=(
                     task.get("schedule_time", ""),
                     _days_display(task.get("schedule_days", [])),
+                    _validity_display(
+                        task.get("schedule_start_date", ""),
+                        task.get("schedule_end_date", ""),
+                    ),
                     _last_result_display(last_result),
                     "Pausada" if not active else "…",
                 ),
@@ -1663,6 +1832,8 @@ class App(tk.Tk):
                     submit_selector=str(entry.get("submit_selector", "") or ""),
                     schedule_time=_normalize_schedule_time(str(entry.get("schedule_time", "08:00"))),
                     schedule_days=_normalize_schedule_days(entry.get("schedule_days")),
+                    schedule_start_date=_normalize_iso_date(str(entry.get("schedule_start_date", ""))),
+                    schedule_end_date=_normalize_iso_date(str(entry.get("schedule_end_date", ""))),
                     keep_alive=bool(entry.get("keep_alive", False)),
                     keep_alive_interval_min=_parse_int_safe(
                         entry.get("keep_alive_interval_min", 5), 5, 1, 120
@@ -1759,12 +1930,39 @@ class App(tk.Tk):
         text.configure(state="disabled")
         text.see("end")
 
+        def _download_log():
+            task_id = self.current_task_id or "tarea"
+            initial = f"aLoguear-{task_id}.log"
+            dest = filedialog.asksaveasfilename(
+                defaultextension=".log",
+                filetypes=[("Archivos de registro", "*.log"), ("Todos los archivos", "*.*")],
+                initialfile=initial,
+                title="Guardar copia del log completo",
+            )
+            if not dest:
+                return
+            try:
+                shutil.copyfile(path, dest)
+            except OSError as exc:
+                messagebox.showerror("Error al guardar", f"No se pudo guardar la copia del log:\n{exc}")
+                return
+            messagebox.showinfo(
+                "Log guardado",
+                f"Copia del log guardada en:\n{dest}\n\nYa puedes adjuntar ese archivo al informar del error.",
+            )
+
         btn_row = ttk.Frame(win, style="TFrame", padding=(10, 0, 10, 10))
         btn_row.pack(fill="x")
         ttk.Button(
             btn_row, text="Abrir carpeta", style="Secondary.TButton",
             command=lambda: os.startfile(os.path.dirname(path)),
         ).pack(side="left")
+        download_btn = ttk.Button(
+            btn_row, text="⬇  Descargar log completo", style="Secondary.TButton",
+            command=_download_log,
+        )
+        download_btn.pack(side="left", padx=(8, 0))
+        ToolTip(download_btn, "Guarda una copia del log completo donde quieras para poder enviarla al informar de un error.")
 
     def on_view_screenshot(self):
         if not self.current_task_id:
@@ -1812,6 +2010,8 @@ class App(tk.Tk):
         self.minute_var.set("00")
         for var in self.day_vars.values():
             var.set(True)
+        self.start_date_var.set("")
+        self.end_date_var.set("")
         self.status_var.set("")
         self.mode_label.configure(text="🆕  Nueva tarea")
         self.delete_btn.grid_remove()
@@ -1853,6 +2053,9 @@ class App(tk.Tk):
         schedule_days = data.get("schedule_days") or [name for _, name in DAYS]
         for day_name, var in self.day_vars.items():
             var.set(day_name in schedule_days)
+
+        self.start_date_var.set(_normalize_iso_date(data.get("schedule_start_date", "")))
+        self.end_date_var.set(_normalize_iso_date(data.get("schedule_end_date", "")))
 
         self.status_var.set("")
         self.mode_label.configure(text=f"✏️  Editando: {data.get('name') or data.get('url', '')}")
@@ -1901,6 +2104,19 @@ class App(tk.Tk):
         if not self._selected_days():
             messagebox.showerror("Sin días seleccionados", "Elige al menos un día de la semana.")
             return False
+        start = self.start_date_var.get().strip()
+        end = self.end_date_var.get().strip()
+        if start and not _normalize_iso_date(start):
+            messagebox.showerror("Fecha de inicio no válida", "Usa el formato YYYY-MM-DD o déjala vacía.")
+            return False
+        if end and not _normalize_iso_date(end):
+            messagebox.showerror("Fecha de fin no válida", "Usa el formato YYYY-MM-DD o déjala vacía.")
+            return False
+        if start and end and _normalize_iso_date(start) > _normalize_iso_date(end):
+            messagebox.showerror(
+                "Rango no válido", "La fecha de inicio no puede ser posterior a la de fin."
+            )
+            return False
         try:
             self._schedule_time_str()
             self._keep_alive_values()
@@ -1936,6 +2152,8 @@ class App(tk.Tk):
                 submit_selector=self.submit_sel_var.get().strip(),
                 schedule_time=self._schedule_time_str(),
                 schedule_days=self._selected_days(),
+                schedule_start_date=_normalize_iso_date(self.start_date_var.get()),
+                schedule_end_date=_normalize_iso_date(self.end_date_var.get()),
                 keep_alive=self.keep_alive_var.get(),
                 keep_alive_interval_min=interval_min,
                 keep_alive_duration_min=duration_min,
@@ -1958,15 +2176,24 @@ class App(tk.Tk):
         self.save_btn.configure(state="disabled")
         threading.Thread(
             target=self._save_and_sync_schedule_thread,
-            args=(self.current_task_id, active, self._schedule_time_str(), self._selected_days()),
+            args=(
+                self.current_task_id, active, self._schedule_time_str(), self._selected_days(),
+                _normalize_iso_date(self.start_date_var.get()),
+                _normalize_iso_date(self.end_date_var.get()),
+            ),
             daemon=True,
         ).start()
 
-    def _save_and_sync_schedule_thread(self, task_id: str, active: bool, time_str: str, days: list):
+    def _save_and_sync_schedule_thread(self, task_id: str, active: bool, time_str: str, days: list,
+                                       start_date: str = "", end_date: str = ""):
         script_dir = _script_dir_global()
         if active:
             ps_script = os.path.join(script_dir, "register_task.ps1")
             args = ["-TaskId", task_id, "-Time", time_str, "-Days", ",".join(days)]
+            if start_date:
+                args += ["-StartDate", start_date]
+            if end_date:
+                args += ["-EndDate", end_date]
             if getattr(sys, "frozen", False):
                 runner_exe = os.path.join(script_dir, "aLoguear-runner.exe")
                 args += ["-RunnerExe", runner_exe]

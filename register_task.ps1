@@ -21,6 +21,14 @@
     se omite, se resuelve python.exe mediante el lanzador "py" (modo
     desarrollo, ejecutando run_login.py).
 
+.PARAMETER StartDate
+    Fecha de inicio de vigencia (YYYY-MM-DD). Vacío = sin límite. Se aplica
+    como StartBoundary del desencadenador y además la comprueba el runner.
+
+.PARAMETER EndDate
+    Fecha de fin de vigencia (YYYY-MM-DD, inclusiva). Vacío = sin límite. Se
+    aplica como EndBoundary del desencadenador y además la comprueba el runner.
+
 .NOTES
     La contraseña se descifra con DPAPI ligado a tu usuario de Windows, por lo
     que la tarea se registra con inicio de sesión "Interactive": solo se
@@ -33,7 +41,9 @@ param(
     [string]$Time = "08:00",
     [string]$Days = "Monday,Tuesday,Wednesday,Thursday,Friday,Saturday,Sunday",
     [string]$TaskName = "",
-    [string]$RunnerExe = ""
+    [string]$RunnerExe = "",
+    [string]$StartDate = "",
+    [string]$EndDate = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -79,6 +89,28 @@ if ($RunnerExe) {
     $action = New-ScheduledTaskAction -Execute $pythonwExe -Argument "`"$runScript`" `"$TaskId`"" -WorkingDirectory $scriptDir
 }
 $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek $dayList -At $Time
+
+# Vigencia por fechas: StartBoundary/EndBoundary del desencadenador. El runner
+# vuelve a comprobarlas (por si la tarea se lanza a mano fuera de rango).
+if ($StartDate -and $StartDate.Trim() -ne "") {
+    try {
+        $startDt = [datetime]::ParseExact($StartDate.Trim(), "yyyy-MM-dd", $null)
+        $timeParts = $Time -split ":"
+        $trigger.StartBoundary = $startDt.AddHours([int]$timeParts[0]).AddMinutes([int]$timeParts[1]).ToString("yyyy-MM-ddTHH:mm:ss")
+    } catch {
+        throw "StartDate no válida (usa YYYY-MM-DD): $StartDate"
+    }
+}
+if ($EndDate -and $EndDate.Trim() -ne "") {
+    try {
+        $endDt = [datetime]::ParseExact($EndDate.Trim(), "yyyy-MM-dd", $null)
+        # Fin de día inclusivo: el desencadenador deja de disparar al terminar ese día.
+        $trigger.EndBoundary = $endDt.AddDays(1).ToString("yyyy-MM-ddTHH:mm:ss")
+    } catch {
+        throw "EndDate no válida (usa YYYY-MM-DD): $EndDate"
+    }
+}
+
 $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
 $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
     -ExecutionTimeLimit ([TimeSpan]::Zero)
@@ -86,4 +118,8 @@ $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatt
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
     -Principal $principal -Settings $settings -Force | Out-Null
 
-Write-Host "Tarea '$TaskName' registrada: se ejecutará a las $Time los días: $($dayList -join ', ') (requiere sesión iniciada)."
+$rangeMsg = ""
+if (($StartDate -and $StartDate.Trim() -ne "") -or ($EndDate -and $EndDate.Trim() -ne "")) {
+    $rangeMsg = " (vigencia: $($StartDate.Trim()) -> $($EndDate.Trim()))"
+}
+Write-Host "Tarea '$TaskName' registrada: se ejecutará a las $Time los días: $($dayList -join ', ')$rangeMsg (requiere sesión iniciada)."

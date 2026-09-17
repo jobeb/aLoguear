@@ -152,6 +152,8 @@ def _migrate_old_config() -> None:
             "submit_selector": old.get("submit_selector", ""),
             "schedule_time": old.get("schedule_time", "08:00"),
             "schedule_days": old.get("schedule_days", []),
+            "schedule_start_date": old.get("schedule_start_date", ""),
+            "schedule_end_date": old.get("schedule_end_date", ""),
         }
         _write_tasks([entry])
     except (OSError, json.JSONDecodeError, ValueError):
@@ -254,7 +256,8 @@ def save_task(task_id: str | None, name: str, url: str, username: str, password:
               submit_selector: str = "", schedule_time: str = "08:00",
               schedule_days: list | None = None, keep_alive: bool = False,
               keep_alive_interval_min: int = 5, keep_alive_duration_min: int = 60,
-              active: bool = True) -> str:
+              active: bool = True, schedule_start_date: str = "",
+              schedule_end_date: str = "") -> str:
     tasks = load_tasks()
     if password:
         encrypted = crypto_utils.protect(password)
@@ -274,6 +277,8 @@ def save_task(task_id: str | None, name: str, url: str, username: str, password:
         "submit_selector": submit_selector,
         "schedule_time": schedule_time,
         "schedule_days": schedule_days if schedule_days is not None else [],
+        "schedule_start_date": schedule_start_date or "",
+        "schedule_end_date": schedule_end_date or "",
         "keep_alive": keep_alive,
         "keep_alive_interval_min": keep_alive_interval_min,
         "keep_alive_duration_min": keep_alive_duration_min,
