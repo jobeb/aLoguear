@@ -33,7 +33,12 @@ jobs:
           if ($tag -ne $ver) { throw "El tag ${{ github.ref_name }} no coincide con version.py ($ver)" }
 
       - name: Sanity check (compileall)
-        run: python -m compileall -q gui_config.py run_login.py config_store.py crypto_utils.py version.py
+        run: python -m compileall -q app_logic.py task_lock.py gui_config.py run_login.py config_store.py crypto_utils.py version.py
+
+      - name: Run tests (bloquea la release si fallan)
+        run: |
+          pip install pytest
+          python -m pytest tests/ -q
 
       - name: Build GUI executable
         run: >

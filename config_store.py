@@ -180,6 +180,11 @@ def session_state_path(task_id: str) -> str:
     return os.path.join(_log_dir(), f"{task_id}_session.json")
 
 
+def lock_path(task_id: str) -> str:
+    """Fichero de lock anti-solape de una tarea (ver task_lock)."""
+    return os.path.join(_log_dir(), f"{task_id}.lock")
+
+
 def save_last_result(task_id: str, success: bool, message: str) -> None:
     log_dir = _log_dir()
     os.makedirs(log_dir, exist_ok=True)
@@ -255,8 +260,9 @@ def save_task(task_id: str | None, name: str, url: str, username: str, password:
               headless: bool, user_selector: str = "", pass_selector: str = "",
               submit_selector: str = "", schedule_time: str = "08:00",
               schedule_days: list | None = None, keep_alive: bool = False,
-              keep_alive_interval_min: int = 5, keep_alive_duration_min: int = 60,
-              active: bool = True, schedule_start_date: str = "",
+               keep_alive_interval_min: int = 5, keep_alive_duration_min: int = 60,
+               keep_alive_url: str = "",
+               active: bool = True, schedule_start_date: str = "",
               schedule_end_date: str = "") -> str:
     tasks = load_tasks()
     if password:
@@ -282,6 +288,7 @@ def save_task(task_id: str | None, name: str, url: str, username: str, password:
         "keep_alive": keep_alive,
         "keep_alive_interval_min": keep_alive_interval_min,
         "keep_alive_duration_min": keep_alive_duration_min,
+        "keep_alive_url": (keep_alive_url or "").strip(),
         "active": active,
     }
     for i, t in enumerate(tasks):

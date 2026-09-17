@@ -1,0 +1,29 @@
+name: Tests
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Sanity check (compileall)
+        run: python -m compileall -q app_logic.py task_lock.py gui_config.py run_login.py config_store.py crypto_utils.py version.py
+
+      - name: Run tests
+        run: python -m pytest tests/ -q

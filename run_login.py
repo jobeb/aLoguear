@@ -23,6 +23,7 @@ import subprocess
 import sys
 import time
 import traceback
+import urllib.parse
 
 # Debe fijarse ANTES de importar playwright: en el .exe empaquetado (PyInstaller),
 # Playwright resuelve la carpeta de navegadores de forma relativa a la carpeta
@@ -39,6 +40,7 @@ if not os.environ.get("PLAYWRIGHT_BROWSERS_PATH"):
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError, Error as PlaywrightError
 
 import config_store
+import task_lock
 
 try:
     from win11toast import toast as _toast
@@ -275,6 +277,43 @@ def check_schedule_dates(cfg: dict, today: datetime.date | None = None) -> tuple
     if end and today > end:
         return False, f"vigencia terminada (terminó el {end.isoformat()})"
     return True, ""
+
+
+def _is_http_url(url: str) -> bool:
+    """Comprueba que sea una URL http(s) completa (para keep_alive_url)."""
+    try:
+        parsed = urllib.parse.urlparse((url or "").strip())
+        return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+    except Exception:
+        return False
+
+
+def goto_keep_alive_url(page, cfg: dict) -> bool:
+    """Si la tarea define `keep_alive_url`, navega a ella tras el login para
+    que el keep-alive mantenga la sesión en esa página de trabajo (p. ej. el
+    curso o panel que interesa) en vez de en la del login.
+
+    Devuelve True si no había URL o la navegación fue bien; False si la URL
+    no era válida o no se pudo abrir (no es fatal: se sigue con la página
+    actual y el mantenimiento la conserva igualmente)."""
+    target = (cfg.get("keep_alive_url") or "").strip()
+    if not target:
+        return True
+    if not _is_http_url(target):
+        log(f"AVISO: keep_alive_url no válida ('{target}'): se mantiene la página actual.")
+        return False
+    try:
+        log(f"Abriendo página de trabajo tras el login: {target}")
+        page.goto(target, wait_until="load", timeout=30000)
+        try:
+            page.wait_for_load_state("networkidle", timeout=15000)
+        except PlaywrightTimeoutError:
+            pass
+        log(f"Página de trabajo lista. URL actual: {page.url}")
+        return True
+    except (PlaywrightTimeoutError, PlaywrightError) as exc:
+        log(f"AVISO: no se pudo abrir keep_alive_url ({exc}); se mantiene la página actual.")
+        return False
 
 
 def detect_only(page, cfg: dict) -> str:
@@ -562,6 +601,25 @@ def main() -> int:
     has_saved_session = os.path.exists(session_path)
 
     browser = None
+    # Lock anti-solape: si el keep-alive de una ejecución anterior sigue vivo
+    # y Windows vuelve a disparar esta tarea, la segunda instancia se omite
+    # (sin marcar fallo) en vez de pelear por la sesión. --detect-only no lo
+    # necesita: es de solo lectura y no toca la sesión.
+    lock_held = False
+    if not detect_only_mode:
+        acquired, info = task_lock.acquire(task_id)
+        if not acquired:
+            other_pid = info.get("pid", "?") if isinstance(info, dict) else "?"
+            message = (
+                f"Tarea omitida: ya hay otra ejecución en curso (PID {other_pid}); "
+                "se evita solaparla para no pelear por la sesión."
+            )
+            log(message)
+            config_store.save_last_result(task_id, True, message)
+            return 0
+        lock_held = True
+        log("Lock anti-solape adquirido.")
+
     try:
         with sync_playwright() as p:
             launch_kwargs = dict(
@@ -637,8 +695,11 @@ def main() -> int:
                     return 1
 
                 # Login correcto (o pestaña cerrada tras el envío, que en varios
-                # sitios también significa éxito): guarda la sesión para la
-                # próxima ejecución.
+                # sitios también significa éxito): si hay página de trabajo
+                # configurada se navega a ella primero, para que la sesión que se
+                # guarda (y el keep-alive después) quede ya en esa página.
+                if status != "closed":
+                    goto_keep_alive_url(page, cfg)
                 try:
                     context.storage_state(path=session_path)
                 except Exception as exc:
@@ -650,12 +711,16 @@ def main() -> int:
                     config_store.save_last_result(task_id, True, "Login OK (la pestaña se cerró tras enviar el formulario).")
                     return 0
 
+                work_page = (cfg.get("keep_alive_url") or "").strip()
                 if cfg.get("keep_alive") and not no_keep_alive:
                     if not cfg.get("keep_alive_duration_min", 60):
                         log("AVISO: keep-alive indefinido (0:00): este proceso quedará vivo "
                             "recargando la página hasta que se detenga la tarea programada.")
                     keep_session_alive(page, cfg, pass_sel)
-                config_store.save_last_result(task_id, True, "Login completado correctamente.")
+                message = "Login completado correctamente."
+                if work_page:
+                    message += f" Página de trabajo: {work_page}."
+                config_store.save_last_result(task_id, True, message)
                 return 0
             except Exception as exc:
                 log(f"ERROR inesperado: {exc}")
@@ -706,6 +771,9 @@ def main() -> int:
         except Exception:
             pass
         return 1
+    finally:
+        if lock_held:
+            task_lock.release(task_id)
 
 
 if __name__ == "__main__":

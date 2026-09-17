@@ -30,6 +30,12 @@ sesión activa (por ejemplo, campus virtuales de formación).
 - Buscador y ordenación por columnas en la lista de tareas.
 - Visor de log integrado y modo "solo detección" (comprueba los selectores sin enviar
   ningún dato, para configurar un sitio nuevo sin arriesgarte a un bloqueo).
+- Lock anti-solape: si una ejecución (p. ej. keep-alive largo) sigue viva, la siguiente
+  no la pisa: se omite sin marcar fallo.
+- Página de trabajo opcional: tras el login, abre un enlace de la plataforma (p. ej.
+  tu curso o panel) y mantiene la sesión en él durante el keep-alive.
+- Acciones en lote: selecciona varias tareas (Ctrl+clic / Mayús+clic) para activarlas,
+  pausarlas o eliminarlas de una vez (atajos: Supr, Ctrl+A, Esc).
 - Rotación de logs y espera progresiva entre reintentos.
 - Sección de **Configuración** (⚙): arranque automático con Windows, activar/desactivar
   notificaciones, elegir qué hace el botón de cerrar (bandeja o salir), tamaño máximo de
@@ -84,11 +90,21 @@ playwright install chromium
 python gui_config.py
 ```
 
+## Tests
+
+```bash
+pip install pytest
+python -m pytest tests/ -q
+```
+
 ## Estructura
 
 | Archivo | Función |
 |---|---|
 | `gui_config.py` | Interfaz gráfica (Tkinter) para crear y gestionar tareas. |
+| `app_logic.py` | Validaciones y formatos puros de la GUI (sin Tkinter, con tests). |
+| `task_lock.py` | Lock anti-solape (`logs/<id>.lock`) para no solapar ejecuciones. |
+| `tests/` | Suite pytest (lógica, lock, config_store, vigencia). |
 | `run_login.py` | Ejecuta el login de una tarea (usado por la GUI y por la tarea programada). |
 | `config_store.py` | Persistencia de tareas, resultados y sesión guardada. |
 | `crypto_utils.py` | Cifrado/descifrado de contraseñas con DPAPI. |
