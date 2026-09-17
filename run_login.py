@@ -41,6 +41,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 
 import config_store
 import task_lock
+from app_logic import _in_time_window
 
 try:
     from win11toast import toast as _toast
@@ -258,6 +259,20 @@ def parse_iso_date(value: str) -> datetime.date | None:
         return None
 
 
+def _in_schedule_range(cfg: dict, today: datetime.date) -> tuple[bool, str]:
+    """Vigencia por fechas SIN avisar (para chequeos frecuentes del keep-alive,
+    donde el aviso ya se dio una vez al arrancar)."""
+    start_raw = (cfg.get("schedule_start_date") or "").strip()
+    end_raw = (cfg.get("schedule_end_date") or "").strip()
+    start = parse_iso_date(start_raw) if start_raw else None
+    end = parse_iso_date(end_raw) if end_raw else None
+    if start and today < start:
+        return False, f"aún no vigente (empieza el {start.isoformat()})"
+    if end and today > end:
+        return False, f"vigencia terminada (terminó el {end.isoformat()})"
+    return True, ""
+
+
 def check_schedule_dates(cfg: dict, today: datetime.date | None = None) -> tuple[bool, str]:
     """Comprueba la vigencia por fechas de la tarea.
 
@@ -266,17 +281,11 @@ def check_schedule_dates(cfg: dict, today: datetime.date | None = None) -> tuple
     today = today or datetime.date.today()
     start_raw = (cfg.get("schedule_start_date") or "").strip()
     end_raw = (cfg.get("schedule_end_date") or "").strip()
-    start = parse_iso_date(start_raw) if start_raw else None
-    end = parse_iso_date(end_raw) if end_raw else None
-    if start_raw and start is None:
+    if start_raw and parse_iso_date(start_raw) is None:
         log(f"AVISO: fecha de inicio '{start_raw}' no válida (se ignora, usa YYYY-MM-DD).")
-    if end_raw and end is None:
+    if end_raw and parse_iso_date(end_raw) is None:
         log(f"AVISO: fecha de fin '{end_raw}' no válida (se ignora, usa YYYY-MM-DD).")
-    if start and today < start:
-        return False, f"aún no vigente (empieza el {start.isoformat()})"
-    if end and today > end:
-        return False, f"vigencia terminada (terminó el {end.isoformat()})"
-    return True, ""
+    return _in_schedule_range(cfg, today)
 
 
 def _is_http_url(url: str) -> bool:
@@ -432,34 +441,85 @@ def perform_login(page, cfg: dict, expect_login_form: bool = True):
 
 
 # Señales en URL/título de que hemos caído a una página de login.
-_LOGIN_URL_HINTS = ("login", "signin", "sign-in", "logon", "auth", "sesion", "sesión", "acceder", "iniciar")
+_LOGIN_URL_HINTS = ("login", "signin", "sign-in", "log-in", "logon", "auth",
+                    "sesion", "sesión", "acceder", "iniciar", "logout",
+                    "expired", "expire", "timeout", "reauth")
+
+# Textos visibles que delatan una sesión caducada (varios idiomas, en minúsculas).
+_SESSION_EXPIRED_TEXTS = (
+    "sesión expirada", "sesion expirada", "sesión caducada", "sesion caducada",
+    "sesión ha expirado", "sesion ha expirado", "tu sesión ha finalizado",
+    "sesión finalizada", "vuelva a iniciar sesión", "vuelve a iniciar sesión",
+    "inicie sesión de nuevo", "session expired", "session has expired",
+    "session timed out", "your session has ended", "sign in again",
+    "log in again", "please log in", "please sign in",
+    "authentication required", "sessão expirada",
+)
 
 
-def is_session_expired(page, pass_sel: str | None) -> bool:
-    """Detecta sesión caducada con varias señales (no solo el campo password):
+def _any_password_visible(page, timeout_ms: int = 1500) -> bool:
+    """Dice si hay algún campo de contraseña visible (señal genérica de login)."""
+    try:
+        return bool(page.locator("input[type='password']").first.is_visible(timeout=timeout_ms))
+    except (PlaywrightError, PlaywrightTimeoutError):
+        return False
+    except Exception:
+        return False
 
-    1. El campo de contraseña vuelve a ser visible, o
-    2. la URL/título contiene pistas de página de login.
+
+def _page_body_text(page, timeout_ms: int = 3000) -> str:
+    """Texto visible de la página en minúsculas ('' si no se puede leer)."""
+    try:
+        return (page.locator("body").first.inner_text(timeout=timeout_ms) or "").lower()
+    except (PlaywrightError, PlaywrightTimeoutError):
+        return ""
+    except Exception:
+        return ""
+
+
+def _same_page(url_a: str, url_b: str) -> bool:
+    """Compara URLs ignorando el fragmento (#...) y la barra final."""
+    def _norm(url: str) -> str:
+        return (url or "").split("#")[0].rstrip("/") or ""
+    return bool(_norm(url_a)) and _norm(url_a) == _norm(url_b)
+
+
+def is_session_expired(page, pass_sel: str | None = None, home_url: str | None = None) -> bool:
+    """Detecta sesión caducada con tres señales (en orden, de barata a cara):
+
+    1. El campo de contraseña original vuelve a ser visible, o
+    2. aparece cualquier campo de contraseña en una página DISTINTA a la que
+       quedó tras el login (`home_url`), o
+    3. la URL/título huele a login Y el cuerpo menciona caducidad de sesión.
+
+    El ancla `home_url` evita falsos positivos (p. ej. un modal de "cambiar
+    contraseña" sobre la propia página de trabajo).
     """
     if pass_sel:
         try:
             if page.locator(pass_sel).first.is_visible():
                 return True
-        except PlaywrightError:
+        except (PlaywrightError, PlaywrightTimeoutError):
+            pass
+        except Exception:
             pass
     try:
-        haystack = f"{page.url} {page.title()}".lower()
-        if any(hint in haystack for hint in _LOGIN_URL_HINTS):
-            # Solo cuenta si además hay un campo de password (evita falsos
-            # positivos en páginas que mencionan "login" en su texto).
-            try:
-                if page.locator("input[type='password']").first.is_visible(timeout=2000):
-                    return True
-            except (PlaywrightError, PlaywrightTimeoutError):
-                pass
-    except PlaywrightError:
-        pass
-    return False
+        current_url = page.url
+    except Exception:
+        current_url = ""
+    if _any_password_visible(page):
+        if home_url and _same_page(current_url, home_url):
+            pass  # misma página: probablemente un formulario propio, no caducidad
+        else:
+            return True
+    try:
+        haystack = f"{current_url} {page.title()}".lower()
+    except Exception:
+        return False
+    if not any(hint in haystack for hint in _LOGIN_URL_HINTS):
+        return False
+    body = _page_body_text(page)
+    return bool(body) and any(text in body for text in _SESSION_EXPIRED_TEXTS)
 
 
 def _jittered_interval(base_min: float, jitter_ratio: float = 0.15) -> float:
@@ -469,105 +529,261 @@ def _jittered_interval(base_min: float, jitter_ratio: float = 0.15) -> float:
     return max(1.0, base_min * (1 + jitter))
 
 
-def keep_session_alive(page, cfg: dict, pass_sel: str | None) -> None:
+def _as_int(value, default: int) -> int:
+    """Convierte a int con tolerancia (config corrupta no debe tumbar el runner)."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _next_wait_min(interval_min: float, remaining_min: float | None = None) -> float:
+    """Próxima espera con jitter, acotada al tiempo restante si hay deadline."""
+    wait_min = _jittered_interval(interval_min)
+    if remaining_min is not None:
+        wait_min = min(wait_min, max(0.0, remaining_min))
+    return wait_min
+
+
+def _backoff_sleep(attempt: int, sleeper, base: float = 5, cap: float = 60) -> None:
+    """Espera progresiva entre reintentos con `sleeper` inyectable (testeable)."""
+    sleeper(min(base * (2 ** (attempt - 1)), cap))
+
+
+_KEEPALIVE_QUANTUM_SEC = 60
+_KEEPALIVE_MAX_CONSECUTIVE_FAILURES = 3
+
+
+def _wait_interruptible(cfg: dict, total_sec: float, sleeper=time.sleep) -> tuple[bool, str]:
+    """Espera `total_sec` por tramos revisando la vigencia por fechas.
+
+    Devuelve (True, '') si se completó, o (False, motivo) si la vigencia
+    terminó a mitad de la espera. No avisa por fechas inválidas (el aviso ya
+    se dio al arrancar) para no ensuciar el log cada minuto.
+    """
+    ok, reason = _in_schedule_range(cfg, datetime.date.today())
+    if not ok:
+        return False, reason
+    remaining = max(0.0, total_sec)
+    while remaining > 0:
+        chunk = min(_KEEPALIVE_QUANTUM_SEC, remaining)
+        sleeper(chunk)
+        remaining -= chunk
+        ok, reason = _in_schedule_range(cfg, datetime.date.today())
+        if not ok:
+            return False, reason
+    return True, ""
+
+
+def _attempt_relogin(page, cfg: dict, max_retries: int = 3, sleeper=time.sleep):
+    """Re-login con reintentos solo ante errores de red/navegación.
+
+    Devuelve (status, pass_sel) con status 'success' | 'failed' | 'closed' |
+    'network-error' (red caída tras agotar reintentos).
+    """
+    status, new_pass_sel, last_exc = None, None, None
+    for attempt in range(1, max_retries + 1):
+        try:
+            status, new_pass_sel = perform_login(page, cfg)
+            last_exc = None
+            break
+        except (PlaywrightTimeoutError, PlaywrightError) as exc:
+            last_exc = exc
+            log(f"Re-login, intento {attempt}/{max_retries} falló por red ({exc}); reintentando...")
+            _backoff_sleep(attempt, sleeper)
+    if last_exc is not None:
+        return "network-error", None
+    return status, new_pass_sel
+
+
+def _keep_alive_summary(stats: dict, work_page: str = "") -> str:
+    """Mensaje final del mantenimiento para el historial de la tarea."""
+    elapsed = stats.get("elapsed_min", 0)
+    refreshes = stats.get("refreshes", 0)
+    relogins = stats.get("relogins", 0)
+    reason = stats.get("end_reason", "finished")
+    if reason == "failed":
+        return (
+            f"Mantenimiento de sesión detenido tras fallos repetidos "
+            f"({refreshes} refrescos, {relogins} re-logins, {elapsed:.0f} min). "
+            f"Revisa el log para ver el detalle."
+        )
+    base = (
+        f"Login completado correctamente. Sesión mantenida {elapsed:.0f} min "
+        f"({refreshes} refrescos, {relogins} re-logins)."
+    )
+    if work_page:
+        base += f" Página de trabajo: {work_page}."
+    if reason == "out-of-range":
+        base += " Detenido al salir de vigencia."
+    elif reason == "tab-closed":
+        base += " La pestaña se cerró; mantenimiento detenido."
+    return base
+
+
+def keep_session_alive(page, cfg: dict, pass_sel: str | None = None,
+                       session_path: str | None = None,
+                       sleeper=time.sleep, clock=time.monotonic,
+                       now_fn=None) -> dict:
     """Recarga la página periódicamente para evitar que el sitio cierre la
     sesión por inactividad. Si detecta que la sesión caducó, reintenta el
-    login automáticamente (hasta 3 veces con espera progresiva).
+    login automáticamente con espera progresiva.
 
-    keep_alive_duration_min = 0 significa 'indefinidamente'. Cada ciclo lleva
-    jitter para no recargar con cadencia de robot, y se respeta la fecha de
-    fin de vigencia: si se alcanza, el mantenimiento termina solo."""
-    interval_min = max(1, cfg.get("keep_alive_interval_min", 5))
-    duration_min = cfg.get("keep_alive_duration_min", 60)
+    - keep_alive_duration_min = 0 significa 'indefinidamente' (deadline real
+      con reloj monotónico: el tiempo cuenta re-logins y todo).
+    - La espera se trocea en tramos de 60 s revisando la vigencia por fechas.
+    - Solo se abandona tras 3 ciclos con fallo CONSECUTIVOS (un ciclo sano
+      resetea el contador); el abandono marca fallo en el historial.
+    - keep_alive_time_from/to (HH:MM, opcional) limita el mantenimiento a una
+      franja horaria; fuera de ella se espera sin actuar.
+    - Tras cada re-login correcto se guarda la sesión para la próxima ejecución.
+
+    Devuelve stats {refreshes, relogins, failures, started_at, elapsed_min,
+    end_reason}: end_reason es 'finished' | 'out-of-range' | 'tab-closed' |
+    'failed'. `sleeper`/`clock`/`now_fn` son inyectables para tests.
+    """
+    if now_fn is None:
+        now_fn = datetime.datetime.now
+    interval_min = max(1, _as_int(cfg.get("keep_alive_interval_min", 5), 5))
+    duration_min = max(0, _as_int(cfg.get("keep_alive_duration_min", 60), 60))
     max_retries = 3
-    max_relogins = 3
-    relogins = 0
+    frm = (cfg.get("keep_alive_time_from") or "").strip()
+    to = (cfg.get("keep_alive_time_to") or "").strip()
+    stats = {"refreshes": 0, "relogins": 0, "failures": 0,
+             "started_at": datetime.datetime.now().isoformat(timespec="seconds"),
+             "elapsed_min": 0.0, "end_reason": "finished"}
 
+    def _elapsed() -> float:
+        elapsed = (clock() - start) / 60
+        stats["elapsed_min"] = round(elapsed, 1)
+        return elapsed
+
+    def _failed_cycle(cycle_msg: str, stop_msg: str) -> bool:
+        """Registra un ciclo con fallo; True si hay que abandonar."""
+        nonlocal consecutive
+        consecutive += 1
+        stats["failures"] += 1
+        log(f"{cycle_msg} (fallo {consecutive}/{_KEEPALIVE_MAX_CONSECUTIVE_FAILURES}).")
+        if consecutive >= _KEEPALIVE_MAX_CONSECUTIVE_FAILURES:
+            log(stop_msg)
+            notify_failure(cfg, stop_msg)
+            stats["end_reason"] = "failed"
+            return True
+        log("Se seguirá intentando en el próximo ciclo.")
+        return False
+
+    start = clock()
+    try:
+        home_url = page.url
+    except Exception:
+        home_url = None
+    window_txt = f" en franja {frm}→{to}" if (frm or to) else ""
     if duration_min:
-        log(f"Manteniendo la sesión activa: recarga ~cada {interval_min} min durante {duration_min} min.")
+        log(f"Manteniendo la sesión activa: recarga ~cada {interval_min} min durante {duration_min} min{window_txt}.")
     else:
-        log(f"Manteniendo la sesión activa: recarga ~cada {interval_min} min indefinidamente.")
+        log(f"Manteniendo la sesión activa: recarga ~cada {interval_min} min indefinidamente{window_txt}.")
+    deadline = start + duration_min * 60 if duration_min else None
 
-    elapsed = 0.0
-    while duration_min == 0 or elapsed < duration_min:
-        wait_min = _jittered_interval(interval_min)
-        if duration_min:
-            wait_min = min(wait_min, duration_min - elapsed)
-        time.sleep(wait_min * 60)
-        elapsed += wait_min
+    consecutive = 0
+    was_inside = None
+    while True:
+        now = clock()
+        elapsed_min = _elapsed()
+        if deadline is not None and now >= deadline:
+            log(f"Fin del tiempo configurado para mantener la sesión activa ({elapsed_min:.0f} min).")
+            stats["end_reason"] = "finished"
+            return stats
+        remaining = (deadline - now) / 60 if deadline is not None else None
 
-        # La vigencia por fechas también corta el keep-alive a mitad de camino.
-        in_range, reason = check_schedule_dates(cfg)
-        if not in_range:
+        # Franja horaria: fuera de ella se espera sin refrescar ni contar fallos.
+        try:
+            inside = _in_time_window(now_fn().strftime("%H:%M"), frm, to)
+        except Exception:
+            inside = True
+        if not inside:
+            if was_inside is not False:
+                log(f"Fuera de la franja horaria ({frm}→{to}); se espera sin refrescar.")
+                was_inside = False
+            ok, reason = _wait_interruptible(cfg, _KEEPALIVE_QUANTUM_SEC, sleeper)
+            if not ok:
+                log(f"Fin del mantenimiento de sesión: {reason}.")
+                stats["end_reason"] = "out-of-range"
+                return stats
+            continue
+        if was_inside is False:
+            log("De nuevo dentro de la franja horaria: se reanuda el mantenimiento.")
+        was_inside = True
+
+        ok, reason = _wait_interruptible(cfg, _next_wait_min(interval_min, remaining) * 60, sleeper)
+        if not ok:
             log(f"Fin del mantenimiento de sesión: {reason}.")
-            return
+            stats["end_reason"] = "out-of-range"
+            return stats
 
         refreshed = False
         for attempt in range(1, max_retries + 1):
             try:
-                page.reload(wait_until="load", timeout=30000)
+                page.reload(wait_until="domcontentloaded", timeout=30000)
                 refreshed = True
                 break
             except PlaywrightError as exc:
-                if page.is_closed():
+                try:
+                    closed = page.is_closed()
+                except Exception:
+                    closed = False
+                if closed:
                     log("Se detiene el mantenimiento de sesión: la pestaña se cerró.")
-                    return
+                    stats["end_reason"] = "tab-closed"
+                    return stats
                 log(f"Intento {attempt}/{max_retries} de refresco falló ({exc}); reintentando...")
-                backoff_wait(attempt)
+                _backoff_sleep(attempt, sleeper)
 
         if not refreshed:
-            message = "No se pudo refrescar la sesión tras varios intentos; se detuvo el mantenimiento."
-            log(message)
-            notify_failure(cfg, message)
-            return
-
-        if not is_session_expired(page, pass_sel):
-            remaining = f", quedan ~{duration_min - elapsed:.0f} min" if duration_min else ""
-            log(f"Sesión refrescada y sigue activa ({elapsed:.0f} min transcurridos{remaining}).")
+            if _failed_cycle("No se pudo refrescar la sesión tras varios intentos",
+                             "No se pudo refrescar la sesión tras varios intentos; se detuvo el mantenimiento."):
+                return stats
             continue
 
-        relogins += 1
-        if relogins > max_relogins:
-            message = (
-                f"La sesión caducó {relogins - 1} veces y se superó el máximo de "
-                f"{max_relogins} re-logins; se detuvo el mantenimiento."
-            )
-            log(message)
-            notify_failure(cfg, message)
-            return
+        if not is_session_expired(page, pass_sel, home_url):
+            consecutive = 0
+            stats["refreshes"] += 1
+            elapsed_min = _elapsed()
+            remaining_txt = ""
+            if deadline is not None:
+                remaining_txt = f", quedan ~{max(0.0, (deadline - clock()) / 60):.0f} min"
+            log(f"Sesión refrescada y sigue activa ({elapsed_min:.0f} min transcurridos{remaining_txt}).")
+            continue
 
-        log(f"La sesión parece haber caducado ({elapsed:.0f} min transcurridos); "
-            f"re-login {relogins}/{max_relogins}...")
-        status, new_pass_sel = None, pass_sel
-        last_exc = None
-        for attempt in range(1, max_retries + 1):
-            try:
-                status, new_pass_sel = perform_login(page, cfg)
-                last_exc = None
-                break
-            except (PlaywrightTimeoutError, PlaywrightError) as exc:
-                last_exc = exc
-                log(f"Re-login {relogins}, intento {attempt}/{max_retries} falló por red ({exc}); reintentando...")
-                backoff_wait(attempt)
-        if last_exc is not None:
-            message = f"Error al reintentar el login automáticamente: {last_exc}"
-            log(message)
-            notify_failure(cfg, message)
-            return
-
+        log(f"La sesión parece haber caducado ({elapsed_min:.0f} min transcurridos); reintentando login...")
+        status, new_pass_sel = _attempt_relogin(page, cfg, max_retries, sleeper)
+        if status == "network-error":
+            if _failed_cycle("El re-login falló por red tras varios intentos",
+                             "No se pudo reintentar el login por fallos de red; se detuvo el mantenimiento."):
+                return stats
+            continue
         if status == "closed":
             log("No se puede seguir manteniendo la sesión activa: la pestaña se cerró durante el re-login.")
-            return
+            stats["end_reason"] = "tab-closed"
+            return stats
         if status == "failed":
-            # No rendirse al primer fallo de credenciales: puede ser un error
-            # transitorio de la página; se sigue vigilando en el próximo ciclo.
-            log("El re-login no tuvo éxito; se seguirá intentando en el próximo ciclo.")
+            hints = collect_error_hints(page)
+            if hints:
+                log(f"Posible mensaje de error en la página: {hints}")
+            if _failed_cycle("El re-login no tuvo éxito",
+                             "El re-login falló en ciclos consecutivos; se detuvo el mantenimiento. Revisa las credenciales en la app."):
+                return stats
             continue
 
-        pass_sel = new_pass_sel
+        consecutive = 0
+        stats["relogins"] += 1
+        pass_sel = new_pass_sel or pass_sel
+        if session_path:
+            try:
+                page.context.storage_state(path=session_path)
+                log("Sesión actualizada tras el re-login correcto.")
+            except Exception as exc:
+                log(f"No se pudo actualizar la sesión guardada tras el re-login: {exc}")
         log("Re-login automático correcto; la sesión se ha restablecido.")
-
-    log("Fin del tiempo configurado para mantener la sesión activa.")
 
 
 def main() -> int:
@@ -716,7 +932,11 @@ def main() -> int:
                     if not cfg.get("keep_alive_duration_min", 60):
                         log("AVISO: keep-alive indefinido (0:00): este proceso quedará vivo "
                             "recargando la página hasta que se detenga la tarea programada.")
-                    keep_session_alive(page, cfg, pass_sel)
+                    stats = keep_session_alive(page, cfg, pass_sel, session_path=session_path)
+                    ok = stats.get("end_reason") != "failed"
+                    message = _keep_alive_summary(stats, work_page)
+                    config_store.save_last_result(task_id, ok, message)
+                    return 0
                 message = "Login completado correctamente."
                 if work_page:
                     message += f" Página de trabajo: {work_page}."

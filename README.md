@@ -17,15 +17,16 @@ sesión activa (por ejemplo, campus virtuales de formación).
   fuera de rango el runner se omite sin marcar fallo, y el Programador de Windows
   también deja de dispararla.
 - Opción de "mantener la sesión activa" tras el login, con recargas con jitter,
-  detección de caducidad por varias señales (campo de contraseña + URL/título) y
-  re-login automático con reintentos y espera progresiva (máx. 3 re-logins).
+  deadline real, espera por tramos con fin de vigencia reactivo, re-login con
+  reintentos (abandona solo tras 3 fallos seguidos), sesión guardada en cada
+  re-login, resultado honesto en el historial y franja horaria opcional
+  (p. ej. solo de 8:00 a 20:00, admite nocturno).
 - Reutilización de sesión (cookies) entre ejecuciones para no repetir logins innecesarios.
 - Historial del resultado de la última ejecución y notificaciones de Windows si falla.
 - Exportar/importar tareas (con o sin contraseñas) para respaldo o mover la configuración
   a otro equipo.
 - Icono en la bandeja del sistema: cerrar la ventana la minimiza en vez de salir.
-- Comprobación de actualizaciones y, en la versión portable, actualización con un clic
-  (descarga la nueva versión y se reemplaza sola).
+- Comprobación de actualizaciones con aviso y descarga manual desde el navegador.
 - Modo oscuro/claro (automático según Windows, o manual desde ⚙ Configuración).
 - Buscador y ordenación por columnas en la lista de tareas.
 - Visor de log integrado y modo "solo detección" (comprueba los selectores sin enviar
@@ -67,20 +68,12 @@ Get-FileHash aLoguear-vX.Y.Z-win64.zip -Algorithm SHA256
 > **"Ejecutar de todas formas"**. Este aviso solo aparece la primera vez que se ejecuta
 > ese archivo en el equipo.
 
-## Si la actualización automática falla
+## Actualizar a una versión nueva
 
-Al pulsar "Actualizar ahora" la app se cierra para reemplazarse. Si no se reabre
-con la versión nueva:
-
-1. Abre el Administrador de tareas y termina cualquier proceso `aLoguear.exe`
-   que siga vivo (un proceso colgado bloquea la copia y el instalador espera).
-2. Vuelve a abrir `aLoguear.exe`: si la actualización no se aplicó, la propia app
-   te avisará y te ofrecerá descargar la versión nueva a mano.
-3. Para el detalle técnico, mira `update.log` junto al `aLoguear.exe` (ahí queda
-   registrado cada paso del instalador).
-4. Vía manual: descarga el `.zip` de la
-   [última versión](https://github.com/jobeb/aLoguear/releases/latest) y
-   descomprímelo encima de tu carpeta actual (con la app cerrada).
+Cuando haya una versión nueva, la app muestra un aviso con el botón
+**"⬇ Descargar actualización"**, que abre la página de la release en el
+navegador. Descarga el `.zip`, cierra la app y descomprímelo encima de tu
+carpeta actual (puedes verificar el `.sha256` adjunto como se explica arriba).
 
 ## Instalación desde el código fuente
 
@@ -116,7 +109,7 @@ python -m pytest tests/ -q
 - Las tareas programadas usan `LogonType Interactive`: solo corren con tu sesión iniciada (exigencia de DPAPI).
 - La sesión reutilizada (`logs/*_session.json`) se guarda en claro: quien copie ese fichero hereda tu sesión.
 - Exportar con contraseñas las deja en texto plano: custodia ese `.json`.
-- La auto-actualización verifica el `.sha256` oficial y se bloquea si no coincide o si el release no lo publica.
+- Descarga las actualizaciones solo desde la página oficial de releases del proyecto.
 - Duración keep-alive `0:00` = indefinido: el runner queda vivo recargando y ocupa su tarea programada.
 
 ## Licencia

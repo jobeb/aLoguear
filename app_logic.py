@@ -84,7 +84,8 @@ _EXPORT_FIELDS = [
     "name", "url", "username", "headless", "user_selector", "pass_selector",
     "submit_selector", "schedule_time", "schedule_days",
     "schedule_start_date", "schedule_end_date", "keep_alive",
-    "keep_alive_interval_min", "keep_alive_duration_min", "keep_alive_url", "active",
+    "keep_alive_interval_min", "keep_alive_duration_min", "keep_alive_url",
+    "keep_alive_time_from", "keep_alive_time_to", "active",
 ]
 
 
@@ -225,3 +226,48 @@ def count_tasks(tasks: list) -> tuple[int, int]:
     total = len(tasks)
     active = sum(1 for t in tasks if t.get("active", True))
     return total, active
+
+
+_HHMM_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
+
+
+def _normalize_hhmm_optional(value: str) -> str:
+    """Normaliza una hora de franja a 'HH:MM' o '' si vacía/inválida.
+
+    Acepta '8:05' (lo pasa a '08:05'); rechaza horas imposibles ('25:00').
+    """
+    value = (value or "").strip()
+    if not value:
+        return ""
+    m = _HHMM_RE.match(value)
+    if not m:
+        return ""
+    try:
+        hour, minute = int(m.group(1)), int(m.group(2))
+    except ValueError:
+        return ""
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return ""
+    return f"{hour:02d}:{minute:02d}"
+
+
+def _in_time_window(now: str, frm: str, to: str) -> bool:
+    """Dice si 'now' (HH:MM) cae dentro de la franja [frm, to).
+
+    Lados vacíos = abiertos (sin límite). Permite franjas nocturnas
+    (22:00→06:00) y frm == to se interpreta como día completo.
+    """
+    now = (now or "").strip()
+    frm = (frm or "").strip()
+    to = (to or "").strip()
+    if not frm and not to:
+        return True
+    if frm and not to:
+        return now >= frm
+    if to and not frm:
+        return now < to
+    if frm == to:
+        return True
+    if frm <= to:
+        return frm <= now < to
+    return now >= frm or now < to  # franja nocturna que cruza medianoche

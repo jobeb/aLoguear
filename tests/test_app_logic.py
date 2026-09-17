@@ -176,3 +176,37 @@ def test_filter_and_count_tasks():
     assert app_logic.filter_tasks(tasks, "BANCO")[0]["name"] == "Banco"
     assert app_logic.filter_tasks(tasks, "nada") == []
     assert app_logic.count_tasks(tasks) == (2, 1)
+
+
+def test_normalize_hhmm_optional():
+    assert app_logic._normalize_hhmm_optional("") == ""
+    assert app_logic._normalize_hhmm_optional("  ") == ""
+    assert app_logic._normalize_hhmm_optional("08:00") == "08:00"
+    assert app_logic._normalize_hhmm_optional("8:05") == "08:05"
+    assert app_logic._normalize_hhmm_optional(" 22:30 ") == "22:30"
+    assert app_logic._normalize_hhmm_optional("23:59") == "23:59"
+    assert app_logic._normalize_hhmm_optional("24:00") == ""
+    assert app_logic._normalize_hhmm_optional("12:60") == ""
+    assert app_logic._normalize_hhmm_optional("8h30") == ""
+    assert app_logic._normalize_hhmm_optional("abc") == ""
+
+
+def test_in_time_window():
+    W = app_logic._in_time_window
+    assert W("10:00", "", "") is True  # sin franja: siempre
+    assert W("10:00", "08:00", "20:00") is True
+    assert W("07:59", "08:00", "20:00") is False
+    assert W("20:00", "08:00", "20:00") is False  # fin exclusivo
+    assert W("08:00", "08:00", "20:00") is True  # inicio inclusivo
+    # Solo un lado: abierto por el otro.
+    assert W("10:00", "08:00", "") is True
+    assert W("07:00", "08:00", "") is False
+    assert W("07:00", "", "20:00") is True
+    assert W("21:00", "", "20:00") is False
+    # Nocturna que cruza medianoche.
+    assert W("23:00", "22:00", "06:00") is True
+    assert W("05:59", "22:00", "06:00") is True
+    assert W("06:00", "22:00", "06:00") is False
+    assert W("12:00", "22:00", "06:00") is False
+    # Igual = día completo.
+    assert W("03:00", "00:00", "00:00") is True

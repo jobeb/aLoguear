@@ -4,21 +4,14 @@ programación), cada una registrable como su propia tarea programada de Windows.
 Guarda las tareas cifradas (DPAPI) en %LOCALAPPDATA%\\AutoLogin\\tasks.json.
 """
 import datetime
-import hashlib
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import tkinter as tk
-import urllib.error
-import urllib.parse
-import urllib.request
 import webbrowser
-import zipfile
 from tkinter import filedialog, messagebox, ttk
 
 import config_store
@@ -40,6 +33,7 @@ from app_logic import (
     _is_valid_url,
     _last_result_display,
     _normalize_iso_date,
+    _normalize_hhmm_optional,
     _normalize_schedule_days,
     _normalize_schedule_time,
     DAY_LABELS,
@@ -217,55 +211,9 @@ def _apply_palette(dark: bool) -> None:
 
 
 # (Definidos en app_logic; se importan arriba para uso y re-export.)
-# Espera a que este proceso (aLoguear.exe) termine, copia los archivos nuevos
-# encima de los actuales (reintentando mientras el .exe siga bloqueado) y
-# vuelve a abrir la app. Se lanza desprendido justo antes de cerrar la app.
-# Todo queda registrado en update.log junto al .exe; si la copia fracasa se
-# crea update.failed para avisar en el próximo arranque (nada es silencioso).
-_UPDATE_BAT_TEMPLATE = """@echo off
-setlocal EnableDelayedExpansion
-
-set "ULOG={log}"
-set "UFLAG={flag}"
-
-echo [%date% %time%] Actualizador iniciado. Esperando fin del proceso {pid}... > "%ULOG%"
-
-:waitloop
-tasklist /FI "PID eq {pid}" 2>nul | find "{pid}" >nul
-if not errorlevel 1 (
-    timeout /t 1 /nobreak >nul
-    goto waitloop
-)
-echo [%date% %time%] Proceso terminado. Copiando archivos... >> "%ULOG%"
-
-set RETRIES=0
-:copyloop
-copy /y "{src}\\aLoguear.exe" "{dest}\\aLoguear.exe" >> "%ULOG%" 2>&1
-if errorlevel 1 (
-    set /a RETRIES+=1
-    echo [%date% %time%] aLoguear.exe bloqueado, reintento !RETRIES!/{retries}... >> "%ULOG%"
-    if !RETRIES! GEQ {retries} goto giveup
-    timeout /t 1 /nobreak >nul
-    goto copyloop
-)
-
-copy /y "{src}\\aLoguear-runner.exe" "{dest}\\aLoguear-runner.exe" >> "%ULOG%" 2>&1
-if errorlevel 1 echo [%date% %time%] AVISO: no se pudo copiar aLoguear-runner.exe (puede estar en uso por una tarea). >> "%ULOG%"
-copy /y "{src}\\register_task.ps1" "{dest}\\register_task.ps1" >> "%ULOG%" 2>&1
-copy /y "{src}\\unregister_task.ps1" "{dest}\\unregister_task.ps1" >> "%ULOG%"
-copy /y "{src}\\list_next_runs.ps1" "{dest}\\list_next_runs.ps1" >> "%ULOG%" 2>&1
-
-echo [%date% %time%] Copia OK. Reiniciando la app... >> "%ULOG%"
-del "%UFLAG%" 2>nul
-start "" "{dest}\\aLoguear.exe"
-goto :eof
-
-:giveup
-echo [%date% %time%] ERROR: no se pudo copiar aLoguear.exe tras {retries} intentos; no se aplica la actualizacion. >> "%ULOG%"
-echo error > "%UFLAG%"
-"""
-
-_UPDATE_MAX_COPY_RETRIES = 30
+# Las rutas update.log/update.failed se conservan para detectar el resto de
+# un auto-actualizador antiguo (ver _check_failed_update); la descarga actual
+# es manual desde el navegador.
 
 
 def _update_log_path() -> str:
@@ -435,6 +383,7 @@ class App(tk.Tk):
         self.current_task_id = None
         self.tray_icon = None
         self._tray_hint_shown = False
+        self._run_now_busy = set()
 
         _unblock_ps_scripts(_script_dir_global())
 
@@ -480,21 +429,20 @@ class App(tk.Tk):
         spacer.pack(fill="x", pady=(14, 0))
 
         # --- Aviso de actualización disponible (oculto hasta comprobarlo) ---
+        # La descarga es manual: el botón abre la release en el navegador.
         self.update_banner = ttk.Frame(self, style="UpdateBanner.TFrame")
         self._update_url = None
-        self._update_asset_url = None
-        self._update_sha_url = None
         self.update_label = ttk.Label(self.update_banner, text="", style="UpdateBanner.TLabel")
         self.update_label.pack(side="left", padx=(16, 8), pady=6)
-        self.update_now_btn = ttk.Button(
-            self.update_banner, text="⬇  Actualizar ahora", style="UpdateBanner.TButton",
-            command=self._start_update_download,
+        self.update_download_btn = ttk.Button(
+            self.update_banner, text="⬇  Descargar actualización", style="UpdateBanner.TButton",
+            command=self._open_update_download,
         )
-        self.update_now_btn.pack(side="left", padx=(0, 6))
-        self.update_link_btn = ttk.Button(
-            self.update_banner, text="Ver novedades", style="UpdateBannerLink.TButton",
-            command=lambda: webbrowser.open(self._update_url) if self._update_url else None,
-        ).pack(side="left")
+        self.update_download_btn.pack(side="left", padx=(0, 6))
+        ToolTip(
+            self.update_download_btn,
+            "Abre la página de la nueva versión en el navegador para descargarla.",
+        )
         self.after(800, self._start_update_check)
         self.after(1500, self._check_failed_update)
 
@@ -532,7 +480,7 @@ class App(tk.Tk):
         row = 0
 
         # --- Lista de tareas guardadas ---
-        list_card = ttk.Labelframe(outer, text="  ①  Tareas guardadas  ", style="Card.TLabelframe", padding=16)
+        list_card = ttk.Labelframe(outer, text="  Tareas guardadas  ", style="Card.TLabelframe", padding=16)
         list_card.grid(row=row, column=0, sticky="ew", pady=(0, 14))
         row += 1
         list_card.grid_columnconfigure(0, weight=1)
@@ -551,7 +499,7 @@ class App(tk.Tk):
             search_row, textvariable=self.search_var, style="Search.TEntry",
         )
         search_entry.grid(row=0, column=1, sticky="ew")
-        ToolTip(search_entry, "Filtrar la lista por nombre o URL.")
+        ToolTip(search_entry, "Filtra la lista mientras escribes, por nombre o URL.")
         self._search_placeholder = "Buscar por nombre o URL…"
         self._search_has_placeholder = False
 
@@ -588,22 +536,28 @@ class App(tk.Tk):
             list_btns, text="⤓  Exportar", style="IconGhost.TButton", command=self.on_export_tasks
         )
         export_btn.pack(side="left", padx=(0, 6))
-        ToolTip(export_btn, "Exportar todas las tareas a un archivo (para respaldo o mover a otro equipo).")
+        ToolTip(export_btn, "Guarda todas las tareas en un archivo .json (respaldo o traslado a otro equipo).\nTe preguntará si incluir las contraseñas: solo hazlo si custodias bien ese archivo.")
 
         import_btn = ttk.Button(
             list_btns, text="⤒  Importar", style="IconGhost.TButton", command=self.on_import_tasks
         )
         import_btn.pack(side="left", padx=(0, 6))
-        ToolTip(import_btn, "Importar tareas desde un archivo exportado antes.")
+        ToolTip(import_btn, "Trae tareas desde un archivo exportado antes.\nSe añaden como copias pausadas: revísalas y pulsa Guardar en cada una para activarlas.")
 
         add_btn = ttk.Button(
             list_btns, text="＋  Nueva tarea", style="AccentSmall.TButton", command=self.on_new_task
         )
-        add_btn.pack(side="left")
-        ToolTip(add_btn, "Limpia el formulario para crear una tarea nueva desde cero.")
+        add_btn.pack(side="left", padx=(0, 6))
+        ToolTip(add_btn, "Vacía el formulario para crear una tarea nueva desde cero.")
+
+        self.run_now_btn = ttk.Button(
+            list_btns, text="▶  Ejecutar", style="AccentSmall.TButton", command=self.on_run_task_now
+        )
+        self.run_now_btn.pack(side="left")
+        ToolTip(self.run_now_btn, "Ejecuta al instante la tarea seleccionada (igual que «Probar ahora», sin tocar el formulario).")
 
         self.tree = ttk.Treeview(
-            list_card, columns=("time", "days", "validity", "last", "next"), show="tree headings", height=6,
+            list_card, columns=("time", "days", "validity", "last", "next", "run"), show="tree headings", height=6,
             selectmode="extended", style="Card.Treeview"
         )
         self._sort_column = None
@@ -614,12 +568,14 @@ class App(tk.Tk):
         self.tree.heading("validity", text="VIGENCIA", command=lambda: self._sort_tree("validity"))
         self.tree.heading("last", text="ÚLTIMA", command=lambda: self._sort_tree("last"))
         self.tree.heading("next", text="PRÓXIMA", command=lambda: self._sort_tree("next"))
+        self.tree.heading("run", text="▶")
         self.tree.column("#0", width=170, minwidth=140, stretch=True)
         self.tree.column("time", width=58, minwidth=52, anchor="center", stretch=False)
         self.tree.column("days", width=92, minwidth=80, anchor="center", stretch=False)
         self.tree.column("validity", width=105, minwidth=95, anchor="center", stretch=False)
         self.tree.column("last", width=105, minwidth=95, anchor="center", stretch=False)
         self.tree.column("next", width=110, minwidth=100, anchor="center", stretch=False)
+        self.tree.column("run", width=44, minwidth=40, anchor="center", stretch=False)
         self.tree.tag_configure("fail_row", background=DANGER_LIGHT)
         self.tree.tag_configure("paused_row", foreground=MUTED)
         self.tree.tag_configure("even_row", background=ZEBRA_BG)
@@ -630,6 +586,14 @@ class App(tk.Tk):
         self.tree.grid(row=1, column=0, sticky="ew")
         tree_scroll_x.grid(row=2, column=0, sticky="ew", pady=(4, 0))
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
+        self.tree.bind("<Button-1>", self._on_tree_click_run, add="+")
+        self.tree.bind("<Motion>", self._on_tree_hover_run, add="+")
+        ToolTip(
+            self.tree,
+            "Clic en una tarea para cargarla en el formulario.\n"
+            "Clic en ▶ para ejecutarla al instante.\n"
+            "Ctrl+clic o Mayús+clic para elegir varias y usar la barra de lote.",
+        )
         # Atajos de la lista: Supr elimina, Ctrl+A selecciona todo, Esc limpia.
         # Se ligan al Treeview (no globales) para no robar Ctrl+A a los campos.
         self.tree.bind("<Delete>", self._on_list_delete_key)
@@ -677,12 +641,12 @@ class App(tk.Tk):
         self.batch_bar.grid_remove()
         ttk.Label(
             list_card,
-            text="Consejo: Ctrl+clic o Mayús+clic para elegir varias · Ctrl+A todas · Supr eliminar · Esc limpiar",
+            text="Consejo: clic en ▶ para ejecutar al instante · Ctrl+clic o Mayús+clic para elegir varias · Ctrl+A todas · Supr eliminar · Esc limpiar",
             style="Muted.TLabel",
         ).grid(row=6, column=0, sticky="w", pady=(6, 0))
 
         # --- Detalles de acceso ---
-        form_card = ttk.Labelframe(outer, text="  ②  Detalles de acceso  ", style="Card.TLabelframe", padding=16)
+        form_card = ttk.Labelframe(outer, text="  Detalles de acceso  ", style="Card.TLabelframe", padding=16)
         form_card.grid(row=row, column=0, sticky="ew", pady=(0, 14))
         row += 1
         form_card.grid_columnconfigure(0, weight=1)
@@ -699,22 +663,22 @@ class App(tk.Tk):
             mode_row, text="≣  Log", style="IconGhost.TButton", command=self.on_view_log
         )
         self.log_btn.grid(row=0, column=2, sticky="e", padx=(0, 6))
-        ToolTip(self.log_btn, "Ver el registro (log) completo de esta tarea.")
+        ToolTip(self.log_btn, "Abre el registro completo de esta tarea (qué pasó en cada ejecución).")
         self.screenshot_btn = ttk.Button(
             mode_row, text="◉  Captura", style="IconGhost.TButton", command=self.on_view_screenshot
         )
         self.screenshot_btn.grid(row=0, column=3, sticky="e", padx=(0, 6))
-        ToolTip(self.screenshot_btn, "Ver la última captura de pantalla guardada de un login fallido.")
+        ToolTip(self.screenshot_btn, "Abre la última captura guardada: muestra qué se veía en la página cuando falló un login.")
         self.duplicate_btn = ttk.Button(
             mode_row, text="⧉  Duplicar", style="IconGhost.TButton", command=self.on_duplicate_task
         )
         self.duplicate_btn.grid(row=0, column=4, sticky="e", padx=(0, 6))
-        ToolTip(self.duplicate_btn, "Duplicar esta tarea como una tarea nueva (sin guardar todavía).")
+        ToolTip(self.duplicate_btn, "Crea una copia de esta tarea como borrador nuevo (tendrás que pulsar Guardar).")
         self.delete_btn = ttk.Button(
             mode_row, text="🗑  Eliminar", style="IconDanger.TButton", command=self.on_delete_task
         )
         self.delete_btn.grid(row=0, column=5, sticky="e")
-        ToolTip(self.delete_btn, "Eliminar esta tarea y su tarea programada de Windows.")
+        ToolTip(self.delete_btn, "Borra esta tarea y su tarea programada de Windows (pide confirmación).")
         frow += 1
 
         ttk.Label(form_card, text="NOMBRE DE LA TAREA", style="Field.TLabel").grid(
@@ -722,7 +686,13 @@ class App(tk.Tk):
         )
         frow += 1
         self.name_var = tk.StringVar()
-        ttk.Entry(form_card, textvariable=self.name_var).grid(row=frow, column=0, sticky="ew", pady=(0, 12))
+        name_entry = ttk.Entry(form_card, textvariable=self.name_var)
+        name_entry.grid(row=frow, column=0, sticky="ew", pady=(0, 12))
+        ToolTip(
+            name_entry,
+            "Nombre para identificar la tarea en la lista y en el Programador de Windows.\n"
+            "Si lo dejas vacío se usa la URL.",
+        )
         frow += 1
 
         ttk.Label(form_card, text="URL DE LA PÁGINA", style="Field.TLabel").grid(
@@ -730,13 +700,25 @@ class App(tk.Tk):
         )
         frow += 1
         self.url_var = tk.StringVar()
-        ttk.Entry(form_card, textvariable=self.url_var).grid(row=frow, column=0, sticky="ew", pady=(0, 12))
+        url_entry = ttk.Entry(form_card, textvariable=self.url_var)
+        url_entry.grid(row=frow, column=0, sticky="ew", pady=(0, 12))
+        ToolTip(
+            url_entry,
+            "Dirección completa de la página de login, con https:// (p. ej. https://campus.ejemplo.es/login).\n"
+            "Es la página que el runner abrirá en el navegador.",
+        )
         frow += 1
 
         ttk.Label(form_card, text="USUARIO", style="Field.TLabel").grid(row=frow, column=0, sticky="w", pady=(0, 4))
         frow += 1
         self.user_var = tk.StringVar()
-        ttk.Entry(form_card, textvariable=self.user_var).grid(row=frow, column=0, sticky="ew", pady=(0, 12))
+        user_entry = ttk.Entry(form_card, textvariable=self.user_var)
+        user_entry.grid(row=frow, column=0, sticky="ew", pady=(0, 12))
+        ToolTip(
+            user_entry,
+            "Usuario o email con el que entras en esa página.\n"
+            "Se guarda tal cual (solo la contraseña va cifrada).",
+        )
         frow += 1
 
         ttk.Label(form_card, text="CONTRASEÑA", style="Field.TLabel").grid(
@@ -749,6 +731,11 @@ class App(tk.Tk):
         self.pass_var = tk.StringVar()
         self.pass_entry = ttk.Entry(pass_row, textvariable=self.pass_var, show="•")
         self.pass_entry.grid(row=0, column=0, sticky="ew")
+        ToolTip(
+            self.pass_entry,
+            "Se cifra con DPAPI ligada a tu usuario de Windows: solo esta cuenta,\n"
+            "en este equipo, puede volver a leerla. Nunca se guarda en texto plano.",
+        )
         self.show_pass_var = tk.BooleanVar(value=False)
         self.show_pass_btn = ttk.Button(
             pass_row, text="Mostrar", style="IconGhost.TButton",
@@ -807,14 +794,22 @@ class App(tk.Tk):
             form_card, text="  Mantener sesión  ", style="Inner.TLabelframe", padding=12
         )
         self.keep_alive_frame.grid_columnconfigure(0, weight=1)
-        ttk.Label(self.keep_alive_frame, text="Refrescar cada", style="Card.TLabel").grid(
+        refresh_row = ttk.Frame(self.keep_alive_frame, style="Card.TFrame")
+        refresh_row.grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Label(refresh_row, text="Refrescar cada", style="Card.TLabel").grid(
             row=0, column=0, sticky="w"
         )
         self.keep_alive_interval_var = tk.StringVar(value="5")
-        ttk.Spinbox(
-            self.keep_alive_frame, from_=1, to=120, width=5, textvariable=self.keep_alive_interval_var
-        ).grid(row=0, column=1, padx=(8, 6))
-        ttk.Label(self.keep_alive_frame, text="min", style="Card.TLabel").grid(
+        ka_interval_spin = ttk.Spinbox(
+            refresh_row, from_=1, to=120, width=5, textvariable=self.keep_alive_interval_var
+        )
+        ka_interval_spin.grid(row=0, column=1, padx=(8, 6))
+        ToolTip(
+            ka_interval_spin,
+            "Cada cuántos minutos recarga la página para simular actividad.\n"
+            "Lleva una variación aleatoria para no parecer un robot con cadencia exacta.",
+        )
+        ttk.Label(refresh_row, text="min", style="Card.TLabel").grid(
             row=0, column=2, sticky="w"
         )
 
@@ -824,16 +819,20 @@ class App(tk.Tk):
         duration_row = ttk.Frame(self.keep_alive_frame, style="Card.TFrame")
         duration_row.grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
         self.keep_alive_duration_hour_var = tk.StringVar(value="01")
-        ttk.Spinbox(
+        ka_hours_spin = ttk.Spinbox(
             duration_row, from_=0, to=23, width=4, format="%02.0f",
             textvariable=self.keep_alive_duration_hour_var, wrap=True
-        ).grid(row=0, column=0)
+        )
+        ka_hours_spin.grid(row=0, column=0)
+        ToolTip(ka_hours_spin, "Horas que se mantiene la sesión tras el login (0–23).")
         ttk.Label(duration_row, text=":", style="Card.TLabel").grid(row=0, column=1, padx=4)
         self.keep_alive_duration_min_var = tk.StringVar(value="00")
-        ttk.Spinbox(
+        ka_minutes_spin = ttk.Spinbox(
             duration_row, from_=0, to=59, width=4, format="%02.0f",
             textvariable=self.keep_alive_duration_min_var, wrap=True
-        ).grid(row=0, column=2)
+        )
+        ka_minutes_spin.grid(row=0, column=2)
+        ToolTip(ka_minutes_spin, "Minutos que se mantiene la sesión tras el login (0–59).")
         ttk.Label(duration_row, text="h : min   ·   0:00 = indefinido", style="Muted.TLabel").grid(
             row=0, column=3, sticky="w", padx=(10, 0)
         )
@@ -854,6 +853,25 @@ class App(tk.Tk):
             self.keep_alive_frame, text="https://…  ·  vacío = página del login",
             style="Muted.TLabel",
         ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(4, 0))
+
+        ttk.Label(
+            self.keep_alive_frame, text="FRANJA HORARIA (OPCIONAL)", style="Field.TLabel"
+        ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        window_row = ttk.Frame(self.keep_alive_frame, style="Card.TFrame")
+        window_row.grid(row=7, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        self.keep_alive_from_var = tk.StringVar(value="")
+        window_from_entry = ttk.Entry(window_row, textvariable=self.keep_alive_from_var, width=8)
+        window_from_entry.grid(row=0, column=0)
+        ToolTip(window_from_entry, "Hora de inicio de la franja (HH:MM, 24 h). Vacío = sin límite.")
+        ttk.Label(window_row, text="→", style="Card.TLabel").grid(row=0, column=1, padx=6)
+        self.keep_alive_to_var = tk.StringVar(value="")
+        window_to_entry = ttk.Entry(window_row, textvariable=self.keep_alive_to_var, width=8)
+        window_to_entry.grid(row=0, column=2)
+        ToolTip(window_to_entry, "Hora de fin de la franja (HH:MM, 24 h). Vacío = sin límite.")
+        ttk.Label(
+            self.keep_alive_frame, text="HH:MM · vacío = todo el día · admite nocturno (22:00→06:00)",
+            style="Muted.TLabel",
+        ).grid(row=8, column=0, columnspan=3, sticky="w", pady=(4, 0))
         # self.keep_alive_frame se muestra/oculta con _toggle_keep_alive(); empieza oculto.
 
         self.adv_expanded = tk.BooleanVar(value=False)
@@ -876,15 +894,33 @@ class App(tk.Tk):
 
         ttk.Label(self.adv, text="Campo usuario", style="Field.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=5)
         self.user_sel_var = tk.StringVar()
-        ttk.Entry(self.adv, textvariable=self.user_sel_var).grid(row=0, column=1, sticky="ew", pady=5)
+        user_sel_entry = ttk.Entry(self.adv, textvariable=self.user_sel_var)
+        user_sel_entry.grid(row=0, column=1, sticky="ew", pady=5)
+        ToolTip(
+            user_sel_entry,
+            "Selector CSS del campo de usuario (p. ej. #username).\n"
+            "Vacío = detección automática: prueba primero así.",
+        )
 
         ttk.Label(self.adv, text="Campo contraseña", style="Field.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=5)
         self.pass_sel_var = tk.StringVar()
-        ttk.Entry(self.adv, textvariable=self.pass_sel_var).grid(row=1, column=1, sticky="ew", pady=5)
+        pass_sel_entry = ttk.Entry(self.adv, textvariable=self.pass_sel_var)
+        pass_sel_entry.grid(row=1, column=1, sticky="ew", pady=5)
+        ToolTip(
+            pass_sel_entry,
+            "Selector CSS del campo de contraseña (p. ej. #password).\n"
+            "Vacío = detección automática: prueba primero así.",
+        )
 
         ttk.Label(self.adv, text="Botón enviar", style="Field.TLabel").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=5)
         self.submit_sel_var = tk.StringVar()
-        ttk.Entry(self.adv, textvariable=self.submit_sel_var).grid(row=2, column=1, sticky="ew", pady=5)
+        submit_sel_entry = ttk.Entry(self.adv, textvariable=self.submit_sel_var)
+        submit_sel_entry.grid(row=2, column=1, sticky="ew", pady=5)
+        ToolTip(
+            submit_sel_entry,
+            "Selector CSS del botón de envío (p. ej. button[type='submit']).\n"
+            "Vacío = se envía pulsando Enter en el campo de contraseña.",
+        )
 
         ttk.Label(
             self.adv, text="Vacío = detección automática. Solo rellena si la web no se detecta bien.",
@@ -893,7 +929,7 @@ class App(tk.Tk):
         # self.adv se muestra/oculta con _toggle_advanced(); empieza contraído.
 
         # --- Programación ---
-        sched = ttk.Labelframe(outer, text="  ③  Programación  ", style="Card.TLabelframe", padding=16)
+        sched = ttk.Labelframe(outer, text="  Programación  ", style="Card.TLabelframe", padding=16)
         sched.grid(row=row, column=0, sticky="ew", pady=(0, 14))
         row += 1
         sched.grid_columnconfigure(1, weight=1)
@@ -903,15 +939,19 @@ class App(tk.Tk):
         time_frame.grid(row=0, column=1, sticky="w")
         self.hour_var = tk.StringVar(value="08")
         self.minute_var = tk.StringVar(value="00")
-        ttk.Spinbox(
+        hour_spin = ttk.Spinbox(
             time_frame, from_=0, to=23, width=4, format="%02.0f",
             textvariable=self.hour_var, wrap=True
-        ).grid(row=0, column=0)
+        )
+        hour_spin.grid(row=0, column=0)
+        ToolTip(hour_spin, "Hora del día (0–23) a la que Windows lanzará la tarea.")
         ttk.Label(time_frame, text=":", style="Card.TLabel").grid(row=0, column=1, padx=4)
-        ttk.Spinbox(
+        minute_spin = ttk.Spinbox(
             time_frame, from_=0, to=59, width=4, format="%02.0f",
             textvariable=self.minute_var, wrap=True
-        ).grid(row=0, column=2)
+        )
+        minute_spin.grid(row=0, column=2)
+        ToolTip(minute_spin, "Minutos de la hora (0–59) a los que Windows lanzará la tarea.")
         ttk.Label(time_frame, text="24 h", style="Muted.TLabel").grid(row=0, column=3, padx=(10, 0))
 
         ttk.Label(sched, text="DÍAS", style="Field.TLabel").grid(row=1, column=0, sticky="nw", padx=(0, 12), pady=(14, 0))
@@ -921,9 +961,11 @@ class App(tk.Tk):
         for i, (label, day_name) in enumerate(DAYS):
             var = tk.BooleanVar(value=True)
             self.day_vars[day_name] = var
-            ttk.Checkbutton(
+            day_chk = ttk.Checkbutton(
                 days_frame, text=label, variable=var, style="Day.TCheckbutton"
-            ).grid(row=0, column=i, padx=(0, 6) if i < len(DAYS) - 1 else (0, 0))
+            )
+            day_chk.grid(row=0, column=i, padx=(0, 6) if i < len(DAYS) - 1 else (0, 0))
+            ToolTip(day_chk, "Marca los días de la semana en que se ejecuta (al menos uno).")
 
         ttk.Label(sched, text="VIGENCIA", style="Field.TLabel").grid(
             row=2, column=0, sticky="nw", padx=(0, 12), pady=(14, 0)
@@ -934,37 +976,18 @@ class App(tk.Tk):
         self.end_date_var = tk.StringVar(value="")
         start_entry = ttk.Entry(validity_frame, textvariable=self.start_date_var, width=14)
         start_entry.grid(row=0, column=0)
-        ToolTip(start_entry, "Fecha de inicio (YYYY-MM-DD). Vacío = sin límite.")
+        ToolTip(start_entry, "Primer día en que la tarea puede ejecutarse (año-mes-día).\nVacío = sin límite de inicio.")
         ttk.Label(validity_frame, text="→", style="Card.TLabel").grid(row=0, column=1, padx=6)
         end_entry = ttk.Entry(validity_frame, textvariable=self.end_date_var, width=14)
         end_entry.grid(row=0, column=2)
-        ToolTip(end_entry, "Fecha de fin (YYYY-MM-DD). Vacío = sin límite.")
+        ToolTip(end_entry, "Último día en que la tarea se ejecuta (año-mes-día).\nVacío = sin límite de fin.")
         ttk.Label(
             validity_frame, text="Formato YYYY-MM-DD · vacío = siempre vigente",
             style="Muted.TLabel"
         ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
-        ttk.Label(sched, text="Vigencia", style="Card.TLabel").grid(
-            row=2, column=0, sticky="nw", padx=(0, 8), pady=(10, 0)
-        )
-        validity_frame = ttk.Frame(sched, style="Card.TFrame")
-        validity_frame.grid(row=2, column=1, sticky="w", pady=(10, 0))
-        self.start_date_var = tk.StringVar(value="")
-        self.end_date_var = tk.StringVar(value="")
-        start_entry = ttk.Entry(validity_frame, textvariable=self.start_date_var, width=12)
-        start_entry.grid(row=0, column=0)
-        ToolTip(start_entry, "Fecha de inicio (YYYY-MM-DD). Vacío = sin límite.")
-        ttk.Label(validity_frame, text="→", style="Card.TLabel").grid(row=0, column=1, padx=5)
-        end_entry = ttk.Entry(validity_frame, textvariable=self.end_date_var, width=12)
-        end_entry.grid(row=0, column=2)
-        ToolTip(end_entry, "Fecha de fin (YYYY-MM-DD). Vacío = sin límite.")
-        ttk.Label(
-            validity_frame, text="YYYY-MM-DD, vacío = siempre vigente",
-            style="Muted.TLabel"
-        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
-
         # --- Guardar / Probar ---
-        action_card = ttk.Labelframe(outer, text="  ④  Acciones  ", style="Card.TLabelframe", padding=16)
+        action_card = ttk.Labelframe(outer, text="  Acciones  ", style="Card.TLabelframe", padding=16)
         action_card.grid(row=row, column=0, sticky="ew", pady=(0, 14))
         row += 1
         action_card.grid_columnconfigure(0, weight=1)
@@ -978,21 +1001,20 @@ class App(tk.Tk):
             btn_frame, text="💾  Guardar y programar", style="Accent.TButton", command=self.on_save
         )
         self.save_btn.grid(row=0, column=0, sticky="ew", padx=(0, 6))
-        ToolTip(self.save_btn, "Guarda esta tarea y crea/actualiza su tarea programada en Windows.")
+        ToolTip(self.save_btn, "Valida y guarda esta tarea, y crea o actualiza su tarea programada en Windows.")
         self.test_btn = ttk.Button(
             btn_frame, text="▶  Probar ahora", style="Secondary.TButton", command=self.on_test
         )
         self.test_btn.grid(row=0, column=1, sticky="ew", padx=(6, 6))
-        ToolTip(self.test_btn, "Guarda esta tarea y ejecuta un login de prueba ahora mismo.")
+        ToolTip(self.test_btn, "Guarda la tarea y lanza un login de prueba ahora mismo (sin esperar al horario).")
         self.detect_btn = ttk.Button(
             btn_frame, text="🔍  Solo detectar", style="Secondary.TButton", command=self.on_detect_only
         )
         self.detect_btn.grid(row=0, column=2, sticky="ew", padx=(6, 0))
         ToolTip(
             self.detect_btn,
-            "Comprueba si encuentra los campos de usuario/contraseña/botón SIN enviar "
-            "nada (útil para validar selectores en un sitio nuevo sin arriesgarte a un "
-            "bloqueo por intento de login fallido).",
+            "Localiza los campos de usuario, contraseña y botón SIN rellenar ni enviar nada.\n"
+            "Úsalo al configurar un sitio nuevo para no arriesgarte a un bloqueo por intentos fallidos.",
         )
 
         self.status_var = tk.StringVar(value="")
@@ -1126,147 +1148,18 @@ class App(tk.Tk):
     def _run_update_check(self):
         result = check_for_update()
         if result:
-            self.after(0, lambda: self._show_update_banner(*result))
+            latest_version, url, _asset_url, _sha_url = result
+            self.after(0, lambda: self._show_update_banner(latest_version, url))
 
-    def _show_update_banner(self, latest_version: str, url: str, asset_url: str | None,
-                              sha_url: str | None = None):
+    def _show_update_banner(self, latest_version: str, url: str):
         self._update_url = url
-        self._update_asset_url = asset_url
-        self._update_sha_url = sha_url
         self.update_label.configure(text=f"🔔  Hay una nueva versión disponible: {latest_version} (tienes {APP_VERSION})")
-        can_self_update = getattr(sys, "frozen", False) and asset_url
-        if can_self_update:
-            self.update_now_btn.pack(side="left", padx=(0, 6), before=self.update_link_btn)
-        else:
-            self.update_now_btn.pack_forget()
         self.update_banner.pack(fill="x", before=self.scroll_container)
 
-    def _start_update_download(self):
-        if not self._update_asset_url:
-            return
-        self.update_now_btn.configure(state="disabled", text="Descargando...")
-        threading.Thread(target=self._download_and_apply_update, daemon=True).start()
-
-    def _download_and_apply_update(self):
-        try:
-            tmp_dir = tempfile.mkdtemp(prefix="aloguear_update_")
-            zip_path = os.path.join(tmp_dir, "update.zip")
-            self.after(0, lambda: self.update_now_btn.configure(text="Descargando..."))
-            req = urllib.request.Request(
-                self._update_asset_url, headers={"User-Agent": "aLoguear-updater"}
-            )
-            with urllib.request.urlopen(req, timeout=600) as resp, open(zip_path, "wb") as f:
-                shutil.copyfileobj(resp, f)
-
-            # Verificación SHA256: bloquea la instalación si no coincide.
-            expected_hash = None
-            sha_url = getattr(self, "_update_sha_url", None)
-            if sha_url:
-                try:
-                    sha_req = urllib.request.Request(
-                        sha_url, headers={"User-Agent": "aLoguear-updater"}
-                    )
-                    with urllib.request.urlopen(sha_req, timeout=30) as resp:
-                        expected_hash = _parse_sha256_file(resp.read().decode("utf-8", errors="ignore"))
-                except Exception as exc:
-                    raise RuntimeError(f"No se pudo obtener el hash SHA256 oficial: {exc}")
-                if not expected_hash:
-                    raise RuntimeError("El fichero .sha256 oficial no tiene un formato válido.")
-                actual_hash = _sha256_of_file(zip_path)
-                if actual_hash != expected_hash:
-                    raise RuntimeError(
-                        "El hash SHA256 descargado no coincide con el oficial. "
-                        "Se bloquea la actualización por seguridad."
-                    )
-            else:
-                raise RuntimeError(
-                    "Este release no publica fichero .sha256; por seguridad no se aplica "
-                    "la auto-actualización. Descárgala manual desde 'Ver novedades'."
-                )
-
-            extract_dir = os.path.join(tmp_dir, "extracted")
-            try:
-                with zipfile.ZipFile(zip_path) as zf:
-                    zf.extractall(extract_dir)
-            except zipfile.BadZipFile:
-                raise RuntimeError(
-                    "Lo descargado no es un .zip válido (¿corte de conexión?). "
-                    "Reinténtalo o descárgalo a mano desde 'Ver novedades'."
-                )
-            if not os.path.exists(os.path.join(extract_dir, "aLoguear.exe")):
-                for name in os.listdir(extract_dir):
-                    sub = os.path.join(extract_dir, name)
-                    if os.path.isdir(sub) and os.path.exists(os.path.join(sub, "aLoguear.exe")):
-                        extract_dir = sub
-                        break
-                else:
-                    raise RuntimeError("El .zip descargado no contiene aLoguear.exe")
-            if not os.path.exists(os.path.join(extract_dir, "aLoguear-runner.exe")):
-                raise RuntimeError("El .zip descargado no contiene aLoguear-runner.exe")
-
-            install_dir = os.path.dirname(sys.executable)
-            # Comprobación de escritura ANTES de cerrar la app: si no podemos
-            # escribir junto al .exe, avisamos ahora en vez de cerrar en vano.
-            try:
-                probe = os.path.join(install_dir, "update.write_test")
-                with open(probe, "w", encoding="utf-8") as f:
-                    f.write("ok")
-                os.remove(probe)
-            except OSError as exc:
-                raise RuntimeError(
-                    f"No hay permiso de escritura en la carpeta de instalación "
-                    f"({install_dir}): {exc}. Ejecuta la app como administrador "
-                    f"o descarga la nueva versión a mano desde 'Ver novedades'."
-                )
-
-            bat_path = os.path.join(tmp_dir, "update.bat")
-            with open(bat_path, "w", encoding="mbcs") as f:
-                f.write(_UPDATE_BAT_TEMPLATE.format(
-                    pid=os.getpid(), src=extract_dir, dest=install_dir,
-                    log=_update_log_path(), flag=_update_failed_flag_path(),
-                    retries=_UPDATE_MAX_COPY_RETRIES,
-                ))
-            try:
-                subprocess.Popen(
-                    ["cmd.exe", "/c", bat_path],
-                    creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
-                )
-            except Exception as exc:
-                raise RuntimeError(f"No se pudo lanzar el instalador (update.bat): {exc}")
-            self.after(0, lambda: self.update_now_btn.configure(text="Instalando..."))
-            self.after(0, self._quit_for_update)
-        except Exception as exc:
-            self.after(0, lambda: self._update_download_failed(str(exc)))
-
-    def _quit_for_update(self):
-        if self.tray_icon is not None:
-            try:
-                self.tray_icon.stop()
-            except Exception:
-                pass
-            self.tray_icon = None
-        try:
-            self.destroy()
-        except Exception:
-            pass
-        # Red de seguridad: destroy() no siempre termina el proceso (un hilo
-        # o componente COM puede dejarlo colgado y entonces el .bat esperaría
-        # eternamente sin instalar nada). Este vigilante garantiza la salida.
-        threading.Thread(target=self._force_exit_watchdog, daemon=True).start()
-
-    @staticmethod
-    def _force_exit_watchdog():
-        import time as _time
-        _time.sleep(5)
-        os._exit(0)
-
-    def _update_download_failed(self, message: str):
-        self.update_now_btn.configure(state="normal", text="⬇  Actualizar ahora")
-        messagebox.showerror(
-            "Error al actualizar",
-            f"No se pudo descargar/aplicar la actualización automáticamente:\n{message}\n\n"
-            "Puedes descargarla a mano desde 'Ver novedades'.",
-        )
+    def _open_update_download(self):
+        """Abre la release en el navegador para descargar la nueva versión."""
+        if self._update_url:
+            webbrowser.open(self._update_url)
 
     def _check_failed_update(self):
         """Si el .bat de una actualización anterior dejó update.failed, avisa
@@ -1836,6 +1729,7 @@ class App(tk.Tk):
                     ),
                     _last_result_display(last_result),
                     "Pausada" if not active else "…",
+                    "⏳" if task["id"] in self._run_now_busy else "▶",
                 ),
                 tags=tuple(tags),
             )
@@ -2062,6 +1956,8 @@ class App(tk.Tk):
                 missing_password += 1
             raw_ka_url = str(entry.get("keep_alive_url", "") or "").strip()
             ka_url = raw_ka_url if _is_valid_url(raw_ka_url) else ""
+            ka_from = _normalize_hhmm_optional(str(entry.get("keep_alive_time_from", "") or ""))
+            ka_to = _normalize_hhmm_optional(str(entry.get("keep_alive_time_to", "") or ""))
             try:
                 config_store.save_task(
                     task_id=None,
@@ -2085,6 +1981,8 @@ class App(tk.Tk):
                         entry.get("keep_alive_duration_min", 60), 60, 0, 24 * 60
                     ),
                     keep_alive_url=ka_url,
+                    keep_alive_time_from=ka_from,
+                    keep_alive_time_to=ka_to,
                     active=False,
                 )
             except Exception:
@@ -2150,6 +2048,8 @@ class App(tk.Tk):
             keep_alive_interval_min=data.get("keep_alive_interval_min", 5),
             keep_alive_duration_min=data.get("keep_alive_duration_min", 60),
             keep_alive_url=data.get("keep_alive_url", ""),
+            keep_alive_time_from=data.get("keep_alive_time_from", ""),
+            keep_alive_time_to=data.get("keep_alive_time_to", ""),
             active=active,
         )
         return True
@@ -2411,6 +2311,8 @@ class App(tk.Tk):
         self.keep_alive_duration_hour_var.set("01")
         self.keep_alive_duration_min_var.set("00")
         self.keep_alive_url_var.set("")
+        self.keep_alive_from_var.set("")
+        self.keep_alive_to_var.set("")
         self.keep_alive_frame.grid_remove()
         self.user_sel_var.set("")
         self.pass_sel_var.set("")
@@ -2443,6 +2345,8 @@ class App(tk.Tk):
         self.keep_alive_var.set(data.get("keep_alive", False))
         self.keep_alive_interval_var.set(str(data.get("keep_alive_interval_min", 5)))
         self.keep_alive_url_var.set((data.get("keep_alive_url") or "").strip())
+        self.keep_alive_from_var.set((data.get("keep_alive_time_from") or "").strip())
+        self.keep_alive_to_var.set((data.get("keep_alive_time_to") or "").strip())
         duration_total = data.get("keep_alive_duration_min", 60)
         try:
             duration_total = int(duration_total)
@@ -2545,6 +2449,20 @@ class App(tk.Tk):
                 "La página de trabajo debe ser una URL completa http(s):// o déjala vacía.",
             )
             return False
+        ka_from = _normalize_hhmm_optional(self.keep_alive_from_var.get())
+        ka_to = _normalize_hhmm_optional(self.keep_alive_to_var.get())
+        if self.keep_alive_from_var.get().strip() and not ka_from:
+            messagebox.showerror(
+                "Franja no válida", "La hora de inicio debe ser HH:MM (24 h) o vacía."
+            )
+            return False
+        if self.keep_alive_to_var.get().strip() and not ka_to:
+            messagebox.showerror(
+                "Franja no válida", "La hora de fin debe ser HH:MM (24 h) o vacía."
+            )
+            return False
+        self.keep_alive_from_var.set(ka_from)
+        self.keep_alive_to_var.set(ka_to)
         try:
             self._schedule_time_str()
             self._keep_alive_values()
@@ -2586,6 +2504,8 @@ class App(tk.Tk):
                 keep_alive_interval_min=interval_min,
                 keep_alive_duration_min=duration_min,
                 keep_alive_url=self.keep_alive_url_var.get().strip(),
+                keep_alive_time_from=self.keep_alive_from_var.get().strip(),
+                keep_alive_time_to=self.keep_alive_to_var.get().strip(),
                 active=self.active_var.get(),
             )
         except Exception as exc:
@@ -2681,6 +2601,87 @@ class App(tk.Tk):
         self._set_status("success" if ok else "danger", message)
         if not ok:
             messagebox.showwarning("Resultado de la prueba", message)
+
+    # --- Ejecutar al instante (desde la fila o la barra de la lista) ---
+
+    def _run_column_id(self) -> str:
+        """Id de columna ttk de la columna ▶ (p. ej. '#6')."""
+        try:
+            return f"#{list(self.tree['columns']).index('run') + 1}"
+        except ValueError:
+            return "#99"
+
+    def _on_tree_click_run(self, event=None):
+        """Clic en la celda ▶ de una fila: ejecuta esa tarea al instante."""
+        try:
+            row = self.tree.identify_row(event.y)
+            col = self.tree.identify_column(event.x)
+        except Exception:
+            return None
+        if not row or col != self._run_column_id():
+            return None
+        self.tree.selection_set(row)
+        self.on_run_task_now(row)
+        return "break"
+
+    def _on_tree_hover_run(self, event=None):
+        """Cursor de mano al pasar sobre la columna ▶."""
+        try:
+            col = self.tree.identify_column(event.x)
+            row = self.tree.identify_row(event.y)
+            self.tree.configure(cursor="hand2" if (row and col == self._run_column_id()) else "")
+        except Exception:
+            pass
+        return None
+
+    def on_run_task_now(self, task_id: str | None = None):
+        """Ejecuta una tarea al instante (como «Probar ahora» pero sin guardar
+        el formulario: usa la configuración guardada tal cual está)."""
+        if task_id is None:
+            ids = self._selected_ids()
+            task_id = ids[0] if len(ids) == 1 else None
+        if not task_id or not self.tree.exists(task_id):
+            messagebox.showinfo(
+                "Nada que ejecutar", "Selecciona una tarea de la lista para ejecutarla al instante."
+            )
+            return
+        if task_id in self._run_now_busy:
+            messagebox.showinfo("Ya en curso", "Esa tarea ya se está ejecutando; espera a que termine.")
+            return
+        task = config_store.get_task(task_id)
+        name = (task.get("name") or task.get("url", task_id)) if task else task_id
+        if not task:
+            messagebox.showerror("No se puede ejecutar", f"La tarea '{task_id}' ya no existe.")
+            return
+        self._run_now_busy.add(task_id)
+        if self.tree.exists(task_id):
+            self.tree.set(task_id, "run", "⏳")
+        self._set_status("info", f"Ejecutando «{name}»… esto puede tardar unos segundos.")
+        self.run_now_btn.configure(state="disabled")
+        threading.Thread(target=self._run_task_now_thread, args=(task_id, name), daemon=True).start()
+
+    def _run_task_now_thread(self, task_id: str, name: str):
+        cmd = _runner_command(task_id, "--no-keep-alive")
+        result = subprocess.run(
+            cmd, cwd=_runner_cwd(), capture_output=True, text=True,
+        )
+        ok = result.returncode == 0
+        message = f"✓ «{name}» ejecutado correctamente." if ok else (
+            "✗ «" + name + "» terminó con errores. Revisa el log en "
+            f"{config_store.log_path(task_id)}"
+        )
+        self.after(0, lambda: self._run_task_now_done(task_id, ok, message))
+
+    def _run_task_now_done(self, task_id: str, ok: bool, message: str):
+        self._run_now_busy.discard(task_id)
+        self.run_now_btn.configure(state="normal")
+        self._refresh_task_list(select_id=task_id if self.tree.exists(task_id) else self.current_task_id)
+        if task_id == self.current_task_id:
+            self._refresh_screenshot_button()
+            self._refresh_log_button()
+        self._set_status("success" if ok else "danger", message)
+        if not ok:
+            messagebox.showwarning("Resultado de la ejecución", message)
 
     # --- Probar detección (sin enviar nada) ---
 

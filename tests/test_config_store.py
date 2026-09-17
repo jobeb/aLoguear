@@ -156,3 +156,24 @@ def test_legacy_task_without_keep_alive_url(isolated_store):
     with open(config_store._tasks_path(), "w", encoding="utf-8") as f:
         json.dump(data, f)
     assert config_store.get_task(task_id).get("keep_alive_url", "") == ""
+
+
+def test_keep_alive_time_window_roundtrip(isolated_store):
+    task_id = config_store.save_task(
+        task_id=None, name="A", url="https://a.example.com",
+        username="u", password="p", headless=True,
+        keep_alive=True, keep_alive_time_from="08:00", keep_alive_time_to="20:00",
+    )
+    full = config_store.get_task(task_id)
+    assert full["keep_alive_time_from"] == "08:00"
+    assert full["keep_alive_time_to"] == "20:00"
+
+
+def test_keep_alive_time_window_defaults_to_empty(isolated_store):
+    task_id = config_store.save_task(
+        task_id=None, name="A", url="https://a.example.com",
+        username="u", password="p", headless=True,
+    )
+    full = config_store.get_task(task_id)
+    assert full.get("keep_alive_time_from", "") == ""
+    assert full.get("keep_alive_time_to", "") == ""
