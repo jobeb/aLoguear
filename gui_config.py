@@ -4,6 +4,7 @@ programación), cada una registrable como su propia tarea programada de Windows.
 Guarda las tareas cifradas (DPAPI) en %LOCALAPPDATA%\\AutoLogin\\tasks.json.
 """
 import datetime
+import glob
 import hashlib
 import json
 import os
@@ -14,6 +15,7 @@ import sys
 import tempfile
 import threading
 import tkinter as tk
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -225,15 +227,43 @@ def _apply_palette(dark: bool) -> None:
 
 _EXPORT_FIELDS = [
     "name", "url", "username", "headless", "user_selector", "pass_selector",
-    "submit_selector", "schedule_time", "schedule_days", "keep_alive",
-    "keep_alive_interval_min", "keep_alive_duration_min", "active",
+    "submit_selector", "schedule_time", "schedule_days",
+    "schedule_start_date", "schedule_end_date", "keep_alive",
+    "keep_alive_interval_min", "keep_alive_duration_min", "keep_alive_mode", "active",
 ]
+
+KEEP_ALIVE_MODES = (
+    ("light", "Ligero (recomendado): sin recargar, no genera conexiones nuevas"),
+    ("reload", "Recarga completa: como antes (puede registrar conexiones)"),
+)
+
+
+def _normalize_keep_alive_mode_gui(value) -> str:
+    v = str(value or "").strip().lower()
+    if v == "reload" or "recarga completa" in v:
+        return "reload"
+    return "light"
+
+
+def _keep_alive_mode_label(mode: str) -> str:
+    mode = _normalize_keep_alive_mode_gui(mode)
+    for key, label in KEEP_ALIVE_MODES:
+        if key == mode:
+            return label
+    return KEEP_ALIVE_MODES[0][1]
 
 # Espera a que este proceso (aLoguear.exe) termine, copia los archivos nuevos
 # encima de los actuales (reintentando mientras el .exe siga bloqueado) y
 # vuelve a abrir la app. Se lanza desprendido justo antes de cerrar la app.
+# Todo queda registrado en update.log junto al .exe; si la copia fracasa se
+# crea update.failed para avisar en el próximo arranque (nada es silencioso).
 _UPDATE_BAT_TEMPLATE = """@echo off
-setlocal
+setlocal EnableDelayedExpansion
+
+set "ULOG={log}"
+set "UFLAG={flag}"
+
+echo [%date% %time%] Actualizador iniciado. Esperando fin del proceso {pid}... > "%ULOG%"
 
 :waitloop
 tasklist /FI "PID eq {pid}" 2>nul | find "{pid}" >nul
@@ -241,28 +271,55 @@ if not errorlevel 1 (
     timeout /t 1 /nobreak >nul
     goto waitloop
 )
+echo [%date% %time%] Proceso terminado. Copiando archivos... >> "%ULOG%"
 
 set RETRIES=0
 :copyloop
-copy /y "{src}\\aLoguear.exe" "{dest}\\aLoguear.exe" >nul 2>&1
+copy /y "{src}\\aLoguear.exe" "{dest}\\aLoguear.exe" >> "%ULOG%" 2>&1
 if errorlevel 1 (
     set /a RETRIES+=1
-    if %RETRIES% GEQ 15 goto giveup
+    echo [%date% %time%] aLoguear.exe bloqueado, reintento !RETRIES!/{retries}... >> "%ULOG%"
+    if !RETRIES! GEQ {retries} goto giveup
     timeout /t 1 /nobreak >nul
     goto copyloop
 )
 
-copy /y "{src}\\aLoguear-runner.exe" "{dest}\\aLoguear-runner.exe" >nul 2>&1
-copy /y "{src}\\register_task.ps1" "{dest}\\register_task.ps1" >nul 2>&1
-copy /y "{src}\\unregister_task.ps1" "{dest}\\unregister_task.ps1" >nul 2>&1
-copy /y "{src}\\list_next_runs.ps1" "{dest}\\list_next_runs.ps1" >nul 2>&1
+copy /y "{src}\\aLoguear-runner.exe" "{dest}\\aLoguear-runner.exe" >> "%ULOG%" 2>&1
+if errorlevel 1 echo [%date% %time%] AVISO: no se pudo copiar aLoguear-runner.exe (puede estar en uso por una tarea). >> "%ULOG%"
+copy /y "{src}\\register_task.ps1" "{dest}\\register_task.ps1" >> "%ULOG%" 2>&1
+copy /y "{src}\\unregister_task.ps1" "{dest}\\unregister_task.ps1" >> "%ULOG%"
+copy /y "{src}\\list_next_runs.ps1" "{dest}\\list_next_runs.ps1" >> "%ULOG%" 2>&1
 
+echo [%date% %time%] Copia OK. Reiniciando la app... >> "%ULOG%"
+del "%UFLAG%" 2>nul
 start "" "{dest}\\aLoguear.exe"
 goto :eof
 
 :giveup
-start "" "{dest}\\aLoguear.exe"
+echo [%date% %time%] ERROR: no se pudo copiar aLoguear.exe tras {retries} intentos; no se aplica la actualizacion. >> "%ULOG%"
+echo error > "%UFLAG%"
 """
+
+_UPDATE_MAX_COPY_RETRIES = 30
+
+
+def _update_log_path() -> str:
+    """Ruta del registro del actualizador, junto al .exe instalado."""
+    return os.path.join(_script_dir_global(), "update.log")
+
+
+def _update_failed_flag_path() -> str:
+    """Fichero que deja el .bat si no pudo aplicar la actualización."""
+    return os.path.join(_script_dir_global(), "update.failed")
+
+
+def _read_update_log_tail(max_lines: int = 12) -> str:
+    try:
+        with open(_update_log_path(), "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+        return "".join(lines[-max_lines:]).strip()
+    except OSError:
+        return ""
 
 
 def _days_display(day_names: list) -> str:
@@ -409,6 +466,66 @@ def _runner_cwd() -> str:
     return _script_dir_global()
 
 
+def _tail_lines(text: str, n: int = 15) -> str:
+    """Últimas `n` líneas de un texto (para llevar la salida del runner al
+    registro general sin inundarlo)."""
+    lines = (text or "").strip().splitlines()
+    return "\n".join(lines[-n:])
+
+
+def _playwright_browsers_path() -> str:
+    """Carpeta de navegadores de Playwright (misma que usa run_login.py)."""
+    custom = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    if custom:
+        return custom
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    return os.path.join(base, "ms-playwright")
+
+
+def _chromium_installed() -> bool:
+    """True si ya hay un Chromium de Playwright descargado."""
+    browsers = _playwright_browsers_path()
+    try:
+        if glob.glob(os.path.join(browsers, "chromium-*", "chrome-win*", "chrome.exe")):
+            return True
+        if glob.glob(os.path.join(browsers, "chromium_headless_shell-*", "chrome-headless-shell-win64", "*")):
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def _confirm_chromium_download(parent) -> bool:
+    """Si Chromium no está instalado, avisa y pide permiso antes de descargar
+    nada. Devuelve True si se puede continuar (ya estaba o el usuario acepta),
+    False si el usuario cancela."""
+    if _chromium_installed():
+        return True
+    return messagebox.askyesno(
+        "Descargar Chromium",
+        "Para ejecutar la prueba hay que descargar Chromium de Playwright "
+        "(~170 MB, solo la primera vez; puede tardar uno o dos minutos).\n\n"
+        "Se abrirá una ventana de CMD con el progreso de la descarga.\n\n"
+        "¿Descargarlo ahora?",
+        parent=parent,
+    )
+
+
+def _install_chromium_visible() -> bool:
+    """Descarga Chromium mostrando el progreso en una ventana de CMD visible.
+
+    Lanza el runner en modo --install-chromium con 'cmd.exe /c' y consola
+    nueva: el usuario ve la barra de progreso en vez de una espera sin nada.
+    Devuelve True si al terminar hay un Chromium utilizable."""
+    try:
+        cmd = ["cmd.exe", "/c", *_runner_command("--install-chromium")]
+        creationflags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+        result = subprocess.run(cmd, cwd=_runner_cwd(), creationflags=creationflags, timeout=600)
+        return result.returncode == 0 and _chromium_installed()
+    except Exception:
+        return _chromium_installed()
+
+
 _TIME_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 _VALID_DAYS = {"Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"}
 
@@ -442,6 +559,44 @@ def _is_valid_url(url: str) -> bool:
         return False
 
 
+_ISO_DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
+
+
+def _normalize_iso_date(value: str) -> str:
+    """Normaliza una fecha de vigencia a 'YYYY-MM-DD' o '' si vacía/inválida."""
+    value = (value or "").strip()
+    if not value:
+        return ""
+    if not _ISO_DATE_RE.match(value):
+        return ""
+    try:
+        datetime.date.fromisoformat(value)
+    except ValueError:
+        return ""
+    return value
+
+
+def _validity_display(start: str, end: str) -> str:
+    """Texto corto de vigencia para la lista: '—' si siempre vigente."""
+    start = (start or "").strip()
+    end = (end or "").strip()
+
+    def _short(iso: str) -> str:
+        try:
+            d = datetime.date.fromisoformat(iso)
+            return d.strftime("%d/%m/%y")
+        except ValueError:
+            return "?"
+
+    if not start and not end:
+        return "—"
+    if start and end:
+        return f"{_short(start)}→{_short(end)}"
+    if start:
+        return f"≥{_short(start)}"
+    return f"≤{_short(end)}"
+
+
 _DATE_SORT_RE = re.compile(r"(\d{2})/(\d{2})\s+(\d{2}):(\d{2})")
 
 
@@ -470,6 +625,17 @@ class App(tk.Tk):
         self.current_task_id = None
         self.tray_icon = None
         self._tray_hint_shown = False
+        self._test_process = None
+        self._test_stop_requested = False
+
+        # Registro general de la app (logs/app.log): recoge arranques, errores
+        # no controlados de la GUI y el resultado de guardar/probar/actualizar.
+        config_store.write_app_log(
+            f"Arranque aLoguear {APP_VERSION} "
+            f"({'empaquetado' if getattr(sys, 'frozen', False) else 'desarrollo'}, "
+            f"datos en {config_store.get_config_dir()})"
+        )
+        self.report_callback_exception = self._log_tk_error
 
         _unblock_ps_scripts(_script_dir_global())
 
@@ -496,6 +662,12 @@ class App(tk.Tk):
         settings_btn.pack(side="right")
         ToolTip(settings_btn, "Configuración de la app (tema claro/oscuro).")
 
+        app_log_btn = ttk.Button(
+            top_row, text="📋", style="HeaderIcon.TButton", width=3, command=self.on_view_app_log
+        )
+        app_log_btn.pack(side="right", padx=(0, 6))
+        ToolTip(app_log_btn, "Registro general de la aplicación (para depuración).")
+
         ttk.Label(
             header, text="Gestiona accesos web y prográmalos como tareas de Windows",
             style="SubHeader.TLabel"
@@ -518,6 +690,7 @@ class App(tk.Tk):
             command=lambda: webbrowser.open(self._update_url) if self._update_url else None,
         ).pack(side="left")
         self.after(800, self._start_update_check)
+        self.after(1500, self._check_failed_update)
 
         # --- Contenedor con scroll (para que la ventana no dependa de caber
         #     entera en pantalla) ---
@@ -594,7 +767,7 @@ class App(tk.Tk):
         ToolTip(add_btn, "Limpia el formulario para crear una tarea nueva desde cero.")
 
         self.tree = ttk.Treeview(
-            list_card, columns=("time", "days", "last", "next"), show="tree headings", height=5,
+            list_card, columns=("time", "days", "validity", "last", "next"), show="tree headings", height=5,
             selectmode="browse", style="Card.Treeview"
         )
         self._sort_column = None
@@ -602,13 +775,15 @@ class App(tk.Tk):
         self.tree.heading("#0", text="Nombre", command=lambda: self._sort_tree("#0"))
         self.tree.heading("time", text="Hora", command=lambda: self._sort_tree("time"))
         self.tree.heading("days", text="Días", command=lambda: self._sort_tree("days"))
+        self.tree.heading("validity", text="Vigencia", command=lambda: self._sort_tree("validity"))
         self.tree.heading("last", text="Última ejecución", command=lambda: self._sort_tree("last"))
         self.tree.heading("next", text="Próxima ejecución", command=lambda: self._sort_tree("next"))
-        self.tree.column("#0", width=140, stretch=True)
+        self.tree.column("#0", width=130, stretch=True)
         self.tree.column("time", width=48, anchor="center", stretch=False)
-        self.tree.column("days", width=85, anchor="center", stretch=False)
-        self.tree.column("last", width=100, anchor="center", stretch=False)
-        self.tree.column("next", width=105, anchor="center", stretch=False)
+        self.tree.column("days", width=80, anchor="center", stretch=False)
+        self.tree.column("validity", width=95, anchor="center", stretch=False)
+        self.tree.column("last", width=95, anchor="center", stretch=False)
+        self.tree.column("next", width=100, anchor="center", stretch=False)
         self.tree.tag_configure("fail_row", background=DANGER_LIGHT)
         self.tree.tag_configure("paused_row", foreground=MUTED)
 
@@ -740,22 +915,41 @@ class App(tk.Tk):
         frow += 1
 
         self.keep_alive_frame = ttk.Frame(form_card, style="Card.TFrame")
-        ttk.Label(self.keep_alive_frame, text="Refrescar cada", style="Card.TLabel").grid(
+        ttk.Label(self.keep_alive_frame, text="Modo", style="Card.TLabel").grid(
             row=0, column=0, sticky="w"
+        )
+        self.keep_alive_mode_var = tk.StringVar(value="light")
+        self.keep_alive_mode_combo = ttk.Combobox(
+            self.keep_alive_frame, textvariable=self.keep_alive_mode_var,
+            values=[label for _, label in KEEP_ALIVE_MODES],
+            state="readonly", width=52,
+        )
+        self.keep_alive_mode_combo.grid(row=0, column=1, columnspan=2, sticky="w", padx=(6, 0), pady=(0, 6))
+        ToolTip(
+            self.keep_alive_mode_combo,
+            "Ligero: mantiene la sesión con actividad mínima (ratón/scroll), sin recargar\n"
+            "la página y sin generar conexiones nuevas. Solo reconecta si la sesión\n"
+            "caducó de verdad (doble confirmación).\n\n"
+            "Recarga completa: comportamiento anterior, recarga la página en cada\n"
+            "intervalo. Algunos sitios lo exigen, pero la plataforma puede contarlo\n"
+            "como una conexión nueva cada vez.",
+        )
+        ttk.Label(self.keep_alive_frame, text="Refrescar cada", style="Card.TLabel").grid(
+            row=1, column=0, sticky="w"
         )
         self.keep_alive_interval_var = tk.StringVar(value="5")
         ttk.Spinbox(
             self.keep_alive_frame, from_=1, to=120, width=4, textvariable=self.keep_alive_interval_var
-        ).grid(row=0, column=1, padx=(6, 4))
+        ).grid(row=1, column=1, padx=(6, 4))
         ttk.Label(self.keep_alive_frame, text="min", style="Card.TLabel").grid(
-            row=0, column=2, sticky="w"
+            row=1, column=2, sticky="w"
         )
 
         ttk.Label(self.keep_alive_frame, text="Dejar de mantenerla tras", style="Card.TLabel").grid(
-            row=1, column=0, columnspan=3, sticky="w", pady=(6, 0)
+            row=2, column=0, columnspan=3, sticky="w", pady=(6, 0)
         )
         duration_row = ttk.Frame(self.keep_alive_frame, style="Card.TFrame")
-        duration_row.grid(row=2, column=0, columnspan=3, sticky="w", pady=(2, 0))
+        duration_row.grid(row=3, column=0, columnspan=3, sticky="w", pady=(2, 0))
         self.keep_alive_duration_hour_var = tk.StringVar(value="01")
         ttk.Spinbox(
             duration_row, from_=0, to=23, width=3, format="%02.0f",
@@ -839,6 +1033,25 @@ class App(tk.Tk):
                 days_frame, text=label, variable=var, style="Day.TCheckbutton"
             ).grid(row=0, column=i, padx=2)
 
+        ttk.Label(sched, text="Vigencia", style="Card.TLabel").grid(
+            row=2, column=0, sticky="nw", padx=(0, 8), pady=(10, 0)
+        )
+        validity_frame = ttk.Frame(sched, style="Card.TFrame")
+        validity_frame.grid(row=2, column=1, sticky="w", pady=(10, 0))
+        self.start_date_var = tk.StringVar(value="")
+        self.end_date_var = tk.StringVar(value="")
+        start_entry = ttk.Entry(validity_frame, textvariable=self.start_date_var, width=12)
+        start_entry.grid(row=0, column=0)
+        ToolTip(start_entry, "Fecha de inicio (YYYY-MM-DD). Vacío = sin límite.")
+        ttk.Label(validity_frame, text="→", style="Card.TLabel").grid(row=0, column=1, padx=5)
+        end_entry = ttk.Entry(validity_frame, textvariable=self.end_date_var, width=12)
+        end_entry.grid(row=0, column=2)
+        ToolTip(end_entry, "Fecha de fin (YYYY-MM-DD). Vacío = sin límite.")
+        ttk.Label(
+            validity_frame, text="YYYY-MM-DD, vacío = siempre vigente",
+            style="Muted.TLabel"
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 0))
+
         # --- Guardar / Probar ---
         btn_frame = ttk.Frame(outer, style="TFrame")
         btn_frame.grid(row=row, column=0, pady=(0, 10))
@@ -853,7 +1066,7 @@ class App(tk.Tk):
             btn_frame, text="▶  Probar ahora", style="Secondary.TButton", command=self.on_test
         )
         self.test_btn.grid(row=0, column=1, padx=(8, 8))
-        ToolTip(self.test_btn, "Guarda esta tarea y ejecuta un login de prueba ahora mismo.")
+        ToolTip(self.test_btn, "Guarda y ejecuta una prueba real con keep-alive en segundo plano (si la tarea lo tiene activado). Pulsa de nuevo para detenerla.")
         self.detect_btn = ttk.Button(
             btn_frame, text="🔍  Probar detección", style="Secondary.TButton", command=self.on_detect_only
         )
@@ -899,19 +1112,59 @@ class App(tk.Tk):
             pass
 
     def _set_app_icon(self):
+        # Candado en todas partes (ventana, barra de tareas y Alt-Tab): el
+        # .ico manda en la barra/título clásicos y el PNG de alta calidad en
+        # iconphoto (incluye los diálogos). Así no aparece la pluma de Tk.
         self._logo_img = None
-        ico_path = os.path.join(ASSETS_DIR, "icon.ico")
-        png_path = os.path.join(ASSETS_DIR, "icon_48.png")
+        self._icon_img = None
+        self._icon_ico_path = os.path.join(ASSETS_DIR, "icon.ico")
         try:
-            if os.path.exists(ico_path):
-                self.iconbitmap(ico_path)
+            if os.path.exists(self._icon_ico_path):
+                self.iconbitmap(self._icon_ico_path)
+        except tk.TclError:
+            pass
+        for png_name in ("icon.png", "icon_48.png"):
+            png_path = os.path.join(ASSETS_DIR, png_name)
+            try:
+                if os.path.exists(png_path):
+                    self._icon_img = tk.PhotoImage(file=png_path)
+                    self.iconphoto(True, self._icon_img)
+                    break
+            except tk.TclError:
+                continue
+        try:
+            logo_path = os.path.join(ASSETS_DIR, "icon_48.png")
+            if os.path.exists(logo_path):
+                self._logo_img = tk.PhotoImage(file=logo_path)
+        except tk.TclError:
+            pass
+
+    def _apply_window_icon(self, win):
+        """Aplica el candado a una ventana secundaria (Ajustes, visor de log)
+        para que no muestre el icono por defecto de Tk."""
+        try:
+            if getattr(self, "_icon_img", None) is not None:
+                win.iconphoto(False, self._icon_img)
         except tk.TclError:
             pass
         try:
-            if os.path.exists(png_path):
-                self._logo_img = tk.PhotoImage(file=png_path)
-                self.iconphoto(True, self._logo_img)
+            ico = getattr(self, "_icon_ico_path", "")
+            if ico and os.path.exists(ico):
+                win.iconbitmap(ico)
         except tk.TclError:
+            pass
+
+    def _log_tk_error(self, exc, val, tb):
+        """Recoge cualquier error no controlado de la GUI en el registro
+        general (logs/app.log) en vez de perderlo por la consola."""
+        try:
+            detail = "".join(traceback.format_exception(exc, val, tb)).strip()
+        except Exception:
+            detail = str(val)
+        config_store.write_app_log(f"ERROR no controlado en la GUI: {detail}")
+        try:
+            super().report_callback_exception(exc, val, tb)
+        except Exception:
             pass
 
     # --- Bandeja del sistema ---
@@ -1002,10 +1255,11 @@ class App(tk.Tk):
         try:
             tmp_dir = tempfile.mkdtemp(prefix="aloguear_update_")
             zip_path = os.path.join(tmp_dir, "update.zip")
+            self.after(0, lambda: self.update_now_btn.configure(text="Descargando..."))
             req = urllib.request.Request(
                 self._update_asset_url, headers={"User-Agent": "aLoguear-updater"}
             )
-            with urllib.request.urlopen(req, timeout=120) as resp, open(zip_path, "wb") as f:
+            with urllib.request.urlopen(req, timeout=600) as resp, open(zip_path, "wb") as f:
                 shutil.copyfileobj(resp, f)
 
             # Verificación SHA256: bloquea la instalación si no coincide.
@@ -1035,8 +1289,14 @@ class App(tk.Tk):
                 )
 
             extract_dir = os.path.join(tmp_dir, "extracted")
-            with zipfile.ZipFile(zip_path) as zf:
-                zf.extractall(extract_dir)
+            try:
+                with zipfile.ZipFile(zip_path) as zf:
+                    zf.extractall(extract_dir)
+            except zipfile.BadZipFile:
+                raise RuntimeError(
+                    "Lo descargado no es un .zip válido (¿corte de conexión?). "
+                    "Reinténtalo o descárgalo a mano desde 'Ver novedades'."
+                )
             if not os.path.exists(os.path.join(extract_dir, "aLoguear.exe")):
                 for name in os.listdir(extract_dir):
                     sub = os.path.join(extract_dir, name)
@@ -1045,17 +1305,40 @@ class App(tk.Tk):
                         break
                 else:
                     raise RuntimeError("El .zip descargado no contiene aLoguear.exe")
+            if not os.path.exists(os.path.join(extract_dir, "aLoguear-runner.exe")):
+                raise RuntimeError("El .zip descargado no contiene aLoguear-runner.exe")
 
             install_dir = os.path.dirname(sys.executable)
+            # Comprobación de escritura ANTES de cerrar la app: si no podemos
+            # escribir junto al .exe, avisamos ahora en vez de cerrar en vano.
+            try:
+                probe = os.path.join(install_dir, "update.write_test")
+                with open(probe, "w", encoding="utf-8") as f:
+                    f.write("ok")
+                os.remove(probe)
+            except OSError as exc:
+                raise RuntimeError(
+                    f"No hay permiso de escritura en la carpeta de instalación "
+                    f"({install_dir}): {exc}. Ejecuta la app como administrador "
+                    f"o descarga la nueva versión a mano desde 'Ver novedades'."
+                )
+
             bat_path = os.path.join(tmp_dir, "update.bat")
             with open(bat_path, "w", encoding="mbcs") as f:
                 f.write(_UPDATE_BAT_TEMPLATE.format(
                     pid=os.getpid(), src=extract_dir, dest=install_dir,
+                    log=_update_log_path(), flag=_update_failed_flag_path(),
+                    retries=_UPDATE_MAX_COPY_RETRIES,
                 ))
-            subprocess.Popen(
-                ["cmd.exe", "/c", bat_path],
-                creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
-            )
+            try:
+                subprocess.Popen(
+                    ["cmd.exe", "/c", bat_path],
+                    creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS,
+                )
+            except Exception as exc:
+                raise RuntimeError(f"No se pudo lanzar el instalador (update.bat): {exc}")
+            self.after(0, lambda: self.update_now_btn.configure(text="Instalando..."))
+            config_store.write_app_log("Actualización descargada y verificada; cerrando para instalar...")
             self.after(0, self._quit_for_update)
         except Exception as exc:
             self.after(0, lambda: self._update_download_failed(str(exc)))
@@ -1066,15 +1349,61 @@ class App(tk.Tk):
                 self.tray_icon.stop()
             except Exception:
                 pass
-        self.destroy()
+            self.tray_icon = None
+        try:
+            self.destroy()
+        except Exception:
+            pass
+        # Red de seguridad: destroy() no siempre termina el proceso (un hilo
+        # o componente COM puede dejarlo colgado y entonces el .bat esperaría
+        # eternamente sin instalar nada). Este vigilante garantiza la salida.
+        threading.Thread(target=self._force_exit_watchdog, daemon=True).start()
+
+    @staticmethod
+    def _force_exit_watchdog():
+        import time as _time
+        _time.sleep(5)
+        os._exit(0)
 
     def _update_download_failed(self, message: str):
+        config_store.write_app_log(f"Actualización automática falló: {message}")
         self.update_now_btn.configure(state="normal", text="⬇  Actualizar ahora")
         messagebox.showerror(
             "Error al actualizar",
             f"No se pudo descargar/aplicar la actualización automáticamente:\n{message}\n\n"
             "Puedes descargarla a mano desde 'Ver novedades'.",
         )
+
+    def _check_failed_update(self):
+        """Si el .bat de una actualización anterior dejó update.failed, avisa
+        con el registro y ofrece la descarga manual. (Antes estos fallos eran
+        totalmente silenciosos: la app se cerraba y no pasaba nada.)"""
+        try:
+            if not os.path.exists(_update_failed_flag_path()):
+                return
+        except Exception:
+            return
+        try:
+            os.remove(_update_failed_flag_path())
+        except OSError:
+            pass
+        detail = _read_update_log_tail(12)
+        config_store.write_app_log(
+            "Arranque con update.failed pendiente (la actualización anterior no se aplicó)."
+            + (f" update.log: {detail}" if detail else "")
+        )
+        message = (
+            "La actualización automática anterior no pudo aplicarse "
+            "(normalmente porque el .exe estaba bloqueado o el antivirus la interceptó).\n"
+            f"Tu versión actual sigue intacta: {APP_VERSION}.\n"
+        )
+        if detail:
+            message += f"\nRegistro del instalador (update.log):\n{detail}\n"
+        else:
+            message += "\nNo hay registro (update.log) con más detalle.\n"
+        message += "\n¿Abrir la página de descargas para actualizar a mano?"
+        if messagebox.askyesno("Actualización no aplicada", message):
+            webbrowser.open(f"https://github.com/{GITHUB_REPO}/releases/latest")
 
     # --- Estilo ---
 
@@ -1108,6 +1437,7 @@ class App(tk.Tk):
 
     def open_settings(self):
         win = tk.Toplevel(self)
+        self._apply_window_icon(win)
         win.title("Configuración")
         win.resizable(False, False)
         win.configure(bg=BG)
@@ -1237,6 +1567,13 @@ class App(tk.Tk):
         ttk.Button(data_card, text="Cambiar carpeta...", style="Secondary.TButton", command=_change_folder).pack(
             anchor="w"
         )
+        ttk.Label(
+            data_card, text="Registro general (para depuración)", style="Card.TLabel"
+        ).pack(anchor="w", pady=(10, 4))
+        ttk.Button(
+            data_card, text="Ver registro de la app...", style="Secondary.TButton",
+            command=lambda: (win.destroy(), self.on_view_app_log()),
+        ).pack(anchor="w")
 
         ttk.Button(body, text="Cerrar", style="Secondary.TButton", command=win.destroy).pack(
             anchor="e", pady=(14, 0)
@@ -1485,6 +1822,10 @@ class App(tk.Tk):
                 values=(
                     task.get("schedule_time", ""),
                     _days_display(task.get("schedule_days", [])),
+                    _validity_display(
+                        task.get("schedule_start_date", ""),
+                        task.get("schedule_end_date", ""),
+                    ),
                     _last_result_display(last_result),
                     "Pausada" if not active else "…",
                 ),
@@ -1610,6 +1951,10 @@ class App(tk.Tk):
         except OSError as exc:
             messagebox.showerror("Error al exportar", str(exc))
             return
+        config_store.write_app_log(
+            f"Tareas exportadas: {len(export_tasks)} a {path} "
+            f"({'con' if include_passwords else 'sin'} contraseñas)"
+        )
         messagebox.showinfo("Tareas exportadas", f"Se exportaron {len(export_tasks)} tarea(s) a:\n{path}")
 
     def on_import_tasks(self):
@@ -1663,12 +2008,17 @@ class App(tk.Tk):
                     submit_selector=str(entry.get("submit_selector", "") or ""),
                     schedule_time=_normalize_schedule_time(str(entry.get("schedule_time", "08:00"))),
                     schedule_days=_normalize_schedule_days(entry.get("schedule_days")),
+                    schedule_start_date=_normalize_iso_date(str(entry.get("schedule_start_date", ""))),
+                    schedule_end_date=_normalize_iso_date(str(entry.get("schedule_end_date", ""))),
                     keep_alive=bool(entry.get("keep_alive", False)),
                     keep_alive_interval_min=_parse_int_safe(
                         entry.get("keep_alive_interval_min", 5), 5, 1, 120
                     ),
                     keep_alive_duration_min=_parse_int_safe(
                         entry.get("keep_alive_duration_min", 60), 60, 0, 24 * 60
+                    ),
+                    keep_alive_mode=_normalize_keep_alive_mode_gui(
+                        entry.get("keep_alive_mode", "light")
                     ),
                     active=False,
                 )
@@ -1677,6 +2027,10 @@ class App(tk.Tk):
                 continue
             imported += 1
         self._refresh_task_list()
+        config_store.write_app_log(
+            f"Tareas importadas desde {path}: {imported} ok, "
+            f"{missing_password} sin contraseña, {skipped} omitidas"
+        )
         message = f"Se importaron {imported} tarea(s), quedaron pausadas."
         if missing_password:
             message += f"\n{missing_password} no traían contraseña: complétala y pulsa Guardar."
@@ -1728,6 +2082,25 @@ class App(tk.Tk):
         if not os.path.exists(path):
             messagebox.showinfo("Sin registro", "Todavía no hay ningún log guardado para esta tarea.")
             return
+        self._show_log_window(
+            f"Log — {self.name_var.get() or self.current_task_id}",
+            path,
+            f"aLoguear-{self.current_task_id}.log",
+        )
+
+    def on_view_app_log(self):
+        """Abre el registro general de la aplicación (logs/app.log)."""
+        path = config_store.app_log_path()
+        if not os.path.exists(path):
+            messagebox.showinfo(
+                "Sin registro",
+                "Todavía no hay registro general (se crea al usar la app).",
+            )
+            return
+        config_store.write_app_log("Se abrió el visor del registro general.")
+        self._show_log_window("Registro de la aplicación", path, "aLoguear-app.log")
+
+    def _show_log_window(self, win_title: str, path: str, initial_filename: str):
         try:
             with open(path, "r", encoding="utf-8", errors="ignore") as f:
                 content = f.read()
@@ -1736,7 +2109,8 @@ class App(tk.Tk):
             return
 
         win = tk.Toplevel(self)
-        win.title(f"Log — {self.name_var.get() or self.current_task_id}")
+        self._apply_window_icon(win)
+        win.title(win_title)
         win.geometry("720x520")
         win.configure(bg=BG)
 
@@ -1759,12 +2133,37 @@ class App(tk.Tk):
         text.configure(state="disabled")
         text.see("end")
 
+        def _download_log():
+            dest = filedialog.asksaveasfilename(
+                defaultextension=".log",
+                filetypes=[("Archivos de registro", "*.log"), ("Todos los archivos", "*.*")],
+                initialfile=initial_filename,
+                title="Guardar copia del log completo",
+            )
+            if not dest:
+                return
+            try:
+                shutil.copyfile(path, dest)
+            except OSError as exc:
+                messagebox.showerror("Error al guardar", f"No se pudo guardar la copia del log:\n{exc}")
+                return
+            messagebox.showinfo(
+                "Log guardado",
+                f"Copia del log guardada en:\n{dest}\n\nYa puedes adjuntar ese archivo al informar del error.",
+            )
+
         btn_row = ttk.Frame(win, style="TFrame", padding=(10, 0, 10, 10))
         btn_row.pack(fill="x")
         ttk.Button(
             btn_row, text="Abrir carpeta", style="Secondary.TButton",
             command=lambda: os.startfile(os.path.dirname(path)),
         ).pack(side="left")
+        download_btn = ttk.Button(
+            btn_row, text="⬇  Descargar log completo", style="Secondary.TButton",
+            command=_download_log,
+        )
+        download_btn.pack(side="left", padx=(8, 0))
+        ToolTip(download_btn, "Guarda una copia del log completo donde quieras para poder enviarla al informar de un error.")
 
     def on_view_screenshot(self):
         if not self.current_task_id:
@@ -1801,6 +2200,7 @@ class App(tk.Tk):
         self.active_var.set(True)
         self.headless_var.set(True)
         self.keep_alive_var.set(False)
+        self.keep_alive_mode_var.set(_keep_alive_mode_label("light"))
         self.keep_alive_interval_var.set("5")
         self.keep_alive_duration_hour_var.set("01")
         self.keep_alive_duration_min_var.set("00")
@@ -1812,6 +2212,8 @@ class App(tk.Tk):
         self.minute_var.set("00")
         for var in self.day_vars.values():
             var.set(True)
+        self.start_date_var.set("")
+        self.end_date_var.set("")
         self.status_var.set("")
         self.mode_label.configure(text="🆕  Nueva tarea")
         self.delete_btn.grid_remove()
@@ -1827,6 +2229,9 @@ class App(tk.Tk):
         self.active_var.set(data.get("active", True))
         self.headless_var.set(data.get("headless", True))
         self.keep_alive_var.set(data.get("keep_alive", False))
+        self.keep_alive_mode_var.set(
+            _keep_alive_mode_label(data.get("keep_alive_mode", "light"))
+        )
         self.keep_alive_interval_var.set(str(data.get("keep_alive_interval_min", 5)))
         duration_total = data.get("keep_alive_duration_min", 60)
         self.keep_alive_duration_hour_var.set(f"{duration_total // 60:02d}")
@@ -1854,6 +2259,9 @@ class App(tk.Tk):
         for day_name, var in self.day_vars.items():
             var.set(day_name in schedule_days)
 
+        self.start_date_var.set(_normalize_iso_date(data.get("schedule_start_date", "")))
+        self.end_date_var.set(_normalize_iso_date(data.get("schedule_end_date", "")))
+
         self.status_var.set("")
         self.mode_label.configure(text=f"✏️  Editando: {data.get('name') or data.get('url', '')}")
         self.delete_btn.grid()
@@ -1873,14 +2281,16 @@ class App(tk.Tk):
         self.minute_var.set(f"{minute:02d}")
         return f"{hour:02d}:{minute:02d}"
 
-    def _keep_alive_values(self) -> tuple[int, int]:
+    def _keep_alive_values(self) -> tuple[int, int, str]:
         interval = _parse_int_safe(self.keep_alive_interval_var.get(), 5, 1, 120)
         hours = _parse_int_safe(self.keep_alive_duration_hour_var.get(), 1, 0, 23)
         minutes = _parse_int_safe(self.keep_alive_duration_min_var.get(), 0, 0, 59)
+        mode = _normalize_keep_alive_mode_gui(self.keep_alive_mode_var.get())
         self.keep_alive_interval_var.set(str(interval))
         self.keep_alive_duration_hour_var.set(f"{hours:02d}")
         self.keep_alive_duration_min_var.set(f"{minutes:02d}")
-        return interval, hours * 60 + minutes
+        self.keep_alive_mode_var.set(_keep_alive_mode_label(mode))
+        return interval, hours * 60 + minutes, mode
 
     def _validate(self) -> bool:
         url = self.url_var.get().strip()
@@ -1901,6 +2311,19 @@ class App(tk.Tk):
         if not self._selected_days():
             messagebox.showerror("Sin días seleccionados", "Elige al menos un día de la semana.")
             return False
+        start = self.start_date_var.get().strip()
+        end = self.end_date_var.get().strip()
+        if start and not _normalize_iso_date(start):
+            messagebox.showerror("Fecha de inicio no válida", "Usa el formato YYYY-MM-DD o déjala vacía.")
+            return False
+        if end and not _normalize_iso_date(end):
+            messagebox.showerror("Fecha de fin no válida", "Usa el formato YYYY-MM-DD o déjala vacía.")
+            return False
+        if start and end and _normalize_iso_date(start) > _normalize_iso_date(end):
+            messagebox.showerror(
+                "Rango no válido", "La fecha de inicio no puede ser posterior a la de fin."
+            )
+            return False
         try:
             self._schedule_time_str()
             self._keep_alive_values()
@@ -1913,12 +2336,12 @@ class App(tk.Tk):
         if not self._validate():
             return False
         name = self.name_var.get().strip() or self.url_var.get().strip()
-        interval_min, duration_min = self._keep_alive_values()
+        interval_min, duration_min, mode = self._keep_alive_values()
         if self.keep_alive_var.get() and duration_min == 0:
             proceed = messagebox.askyesno(
                 "Mantener sesión indefinidamente",
                 "Has puesto 0:00 (= indefinido): el proceso del runner quedará vivo "
-                "para siempre recargando la página y ocupará su tarea programada.\n\n"
+                "para siempre con actividad periódica y ocupará su tarea programada.\n\n"
                 "¿Seguro que quieres guardarlo así?",
             )
             if not proceed:
@@ -1936,9 +2359,12 @@ class App(tk.Tk):
                 submit_selector=self.submit_sel_var.get().strip(),
                 schedule_time=self._schedule_time_str(),
                 schedule_days=self._selected_days(),
+                schedule_start_date=_normalize_iso_date(self.start_date_var.get()),
+                schedule_end_date=_normalize_iso_date(self.end_date_var.get()),
                 keep_alive=self.keep_alive_var.get(),
                 keep_alive_interval_min=interval_min,
                 keep_alive_duration_min=duration_min,
+                keep_alive_mode=mode,
                 active=self.active_var.get(),
             )
         except Exception as exc:
@@ -1958,15 +2384,24 @@ class App(tk.Tk):
         self.save_btn.configure(state="disabled")
         threading.Thread(
             target=self._save_and_sync_schedule_thread,
-            args=(self.current_task_id, active, self._schedule_time_str(), self._selected_days()),
+            args=(
+                self.current_task_id, active, self._schedule_time_str(), self._selected_days(),
+                _normalize_iso_date(self.start_date_var.get()),
+                _normalize_iso_date(self.end_date_var.get()),
+            ),
             daemon=True,
         ).start()
 
-    def _save_and_sync_schedule_thread(self, task_id: str, active: bool, time_str: str, days: list):
+    def _save_and_sync_schedule_thread(self, task_id: str, active: bool, time_str: str, days: list,
+                                       start_date: str = "", end_date: str = ""):
         script_dir = _script_dir_global()
         if active:
             ps_script = os.path.join(script_dir, "register_task.ps1")
             args = ["-TaskId", task_id, "-Time", time_str, "-Days", ",".join(days)]
+            if start_date:
+                args += ["-StartDate", start_date]
+            if end_date:
+                args += ["-EndDate", end_date]
             if getattr(sys, "frozen", False):
                 runner_exe = os.path.join(script_dir, "aLoguear-runner.exe")
                 args += ["-RunnerExe", runner_exe]
@@ -1995,33 +2430,126 @@ class App(tk.Tk):
         self._refresh_task_list(select_id=self.current_task_id)
         self.status_label.configure(style="Success.TLabel" if ok else "Danger.TLabel")
         self.status_var.set(message)
+        config_store.write_app_log(
+            f"Guardar tarea {self.current_task_id}: {'OK' if ok else 'FALLO'} — {message}"
+        )
         if not ok:
             messagebox.showwarning("Resultado de la programación", message)
 
     # --- Probar ahora ---
 
     def on_test(self):
+        # Si ya hay una prueba con keep-alive en marcha, este botón la detiene.
+        proc = getattr(self, "_test_process", None)
+        try:
+            running = proc is not None and proc.poll() is None
+        except Exception:
+            running = False
+        if running:
+            self._stop_test_process()
+            return
         if not self._save():
             return
+        needs_download = not _chromium_installed()
+        if needs_download and not _confirm_chromium_download(self):
+            self.status_var.set("Prueba cancelada: no se descargó Chromium.")
+            return
         self.status_label.configure(style="Info.TLabel")
-        self.status_var.set("Ejecutando prueba de login...")
-        self.test_btn.configure(state="disabled")
+        if needs_download:
+            self.status_var.set("Descargando Chromium (solo la primera vez, puede tardar 1-2 min)...")
+        else:
+            self.status_var.set("Iniciando prueba con keep-alive...")
+        self.test_btn.configure(text="⏹  Detener prueba", state="normal")
+        self._test_stop_requested = False
         threading.Thread(target=self._run_test, args=(self.current_task_id,), daemon=True).start()
 
     def _run_test(self, task_id: str):
-        cmd = _runner_command(task_id, "--no-keep-alive")
-        result = subprocess.run(
-            cmd, cwd=_runner_cwd(), capture_output=True, text=True,
-        )
-        ok = result.returncode == 0
-        message = "✓ Login ejecutado correctamente." if ok else (
-            "✗ El login terminó con errores. Revisa el log en "
-            f"{config_store.log_path(task_id)}"
-        )
+        if not _chromium_installed():
+            # La descarga se hace en una CMD visible (con progreso); si falla
+            # o el usuario la cierra, no se lanza la prueba.
+            if not _install_chromium_visible():
+                message = (
+                    "✗ No se pudo descargar Chromium (o se canceló la descarga). "
+                    "Vuelve a pulsar 'Probar ahora' para intentarlo de nuevo."
+                )
+                self.after(0, lambda: self._test_done(False, message))
+                return
+        # Prueba REAL: sin --no-keep-alive, para que si la tarea tiene
+        # "mantener sesión activa" se quede viva igual que la programada.
+        cmd = _runner_command(task_id)
+        config_store.write_app_log(f"Probar ahora tarea {task_id}: lanzando runner con keep-alive...")
+        try:
+            proc = subprocess.Popen(cmd, cwd=_runner_cwd())
+        except Exception as exc:
+            self.after(0, lambda: self._test_done(False, f"✗ No se pudo lanzar la prueba: {exc}"))
+            return
+        self._test_process = proc
+        self.after(0, lambda: self._test_started(task_id))
+        try:
+            returncode = proc.wait()
+        except Exception:
+            returncode = proc.poll()
+        # Si lo detuvo el usuario con ⏹ ya se mostró "detenida": no pisarlo.
+        if getattr(self, "_test_stop_requested", False):
+            return
+        self._test_process = None
+        ok = returncode == 0
+        config_store.write_app_log(f"Probar ahora tarea {task_id}: exit={returncode}")
+        if ok:
+            message = "✓ Prueba terminada correctamente (incluido el keep-alive configurado)."
+        else:
+            message = (
+                "✗ La prueba terminó con errores. Revisa el log en "
+                f"{config_store.log_path(task_id)}"
+            )
         self.after(0, lambda: self._test_done(ok, message))
 
+    def _test_started(self, task_id: str):
+        self.test_btn.configure(text="⏹  Detener prueba", state="normal")
+        self.status_label.configure(style="Info.TLabel")
+        self.status_var.set(
+            "Prueba con keep-alive en marcha en segundo plano. "
+            "Mira el progreso en 📄 y pulsa Detener para pararla."
+        )
+        self._refresh_log_button()
+
+    def _stop_test_process(self):
+        proc = getattr(self, "_test_process", None)
+        self._test_stop_requested = True
+        if proc is not None:
+            try:
+                if proc.poll() is None:
+                    config_store.write_app_log("Probar ahora: detención solicitada por el usuario.")
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+        self._test_process = None
+        try:
+            self.test_btn.configure(text="▶  Probar ahora", state="normal")
+        except Exception:
+            pass
+        try:
+            self.status_label.configure(style="Info.TLabel")
+            self.status_var.set("Prueba detenida por el usuario.")
+            self._refresh_task_list(select_id=self.current_task_id)
+            self._refresh_screenshot_button()
+            self._refresh_log_button()
+        except Exception:
+            pass
+
     def _test_done(self, ok: bool, message: str):
-        self.test_btn.configure(state="normal")
+        self._test_process = None
+        try:
+            self.test_btn.configure(text="▶  Probar ahora", state="normal")
+        except Exception:
+            pass
         self._refresh_task_list(select_id=self.current_task_id)
         self._refresh_screenshot_button()
         self._refresh_log_button()
@@ -2030,22 +2558,59 @@ class App(tk.Tk):
         if not ok:
             messagebox.showwarning("Resultado de la prueba", message)
 
+    def destroy(self):
+        # No dejar runners de prueba colgados al salir de la app.
+        try:
+            proc = getattr(self, "_test_process", None)
+            if proc is not None and proc.poll() is None:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            super().destroy()
+        except Exception:
+            pass
+
     # --- Probar detección (sin enviar nada) ---
 
     def on_detect_only(self):
         if not self._save():
             return
+        needs_download = not _chromium_installed()
+        if needs_download and not _confirm_chromium_download(self):
+            self.status_var.set("Comprobación cancelada: no se descargó Chromium.")
+            return
         self.status_label.configure(style="Info.TLabel")
-        self.status_var.set("Comprobando los selectores (no se enviará nada)...")
+        if needs_download:
+            self.status_var.set("Descargando Chromium (solo la primera vez, puede tardar 1-2 min)...")
+        else:
+            self.status_var.set("Comprobando los selectores (no se enviará nada)...")
         self.detect_btn.configure(state="disabled")
         threading.Thread(target=self._run_detect_only, args=(self.current_task_id,), daemon=True).start()
 
     def _run_detect_only(self, task_id: str):
+        if not _chromium_installed():
+            if not _install_chromium_visible():
+                message = (
+                    "✗ No se pudo descargar Chromium (o se canceló la descarga). "
+                    "Vuelve a pulsar 'Probar detección' para intentarlo de nuevo."
+                )
+                self.after(0, lambda: self._detect_only_done(False, message))
+                return
         cmd = _runner_command(task_id, "--detect-only")
+        config_store.write_app_log(f"Probar detección tarea {task_id}: lanzando runner...")
         result = subprocess.run(
             cmd, cwd=_runner_cwd(), capture_output=True, text=True,
         )
         ok = result.returncode == 0
+        config_store.write_app_log(f"Probar detección tarea {task_id}: exit={result.returncode}")
+        if not ok:
+            detail = _tail_lines(result.stderr or result.stdout)
+            if detail:
+                config_store.write_app_log(f"Salida del runner (tarea {task_id}):\n{detail}")
         message = "✓ Se encontraron los campos de usuario y contraseña." if ok else (
             "✗ No se encontraron todos los campos. Revisa el log para ver el detalle "
             "y ajusta los selectores CSS en Avanzado si hace falta."

@@ -13,8 +13,12 @@ sesión activa (por ejemplo, campus virtuales de formación).
   CSS manuales como respaldo.
 - Programación por hora y días de la semana, integrada con el Programador de tareas de
   Windows (crear, actualizar, pausar y eliminar desde la propia app).
-- Opción de "mantener la sesión activa" tras el login, con reintentos y re-login
-  automático si la sesión caduca.
+- Vigencia por fechas: cada tarea puede tener fecha de inicio y fin (YYYY-MM-DD);
+  fuera de rango el runner se omite sin marcar fallo, y el Programador de Windows
+  también deja de dispararla.
+- Opción de "mantener la sesión activa" tras el login, con recargas con jitter,
+  detección de caducidad por varias señales (campo de contraseña + URL/título) y
+  re-login automático con reintentos y espera progresiva (máx. 3 re-logins).
 - Reutilización de sesión (cookies) entre ejecuciones para no repetir logins innecesarios.
 - Historial del resultado de la última ejecución y notificaciones de Windows si falla.
 - Exportar/importar tareas (con o sin contraseñas) para respaldo o mover la configuración
@@ -56,6 +60,21 @@ Get-FileHash aLoguear-vX.Y.Z-win64.zip -Algorithm SHA256
 > firma comercial). Para continuar: pulsa **"Más información"** y luego
 > **"Ejecutar de todas formas"**. Este aviso solo aparece la primera vez que se ejecuta
 > ese archivo en el equipo.
+
+## Si la actualización automática falla
+
+Al pulsar "Actualizar ahora" la app se cierra para reemplazarse. Si no se reabre
+con la versión nueva:
+
+1. Abre el Administrador de tareas y termina cualquier proceso `aLoguear.exe`
+   que siga vivo (un proceso colgado bloquea la copia y el instalador espera).
+2. Vuelve a abrir `aLoguear.exe`: si la actualización no se aplicó, la propia app
+   te avisará y te ofrecerá descargar la versión nueva a mano.
+3. Para el detalle técnico, mira `update.log` junto al `aLoguear.exe` (ahí queda
+   registrado cada paso del instalador).
+4. Vía manual: descarga el `.zip` de la
+   [última versión](https://github.com/jobeb/aLoguear/releases/latest) y
+   descomprímelo encima de tu carpeta actual (con la app cerrada).
 
 ## Instalación desde el código fuente
 

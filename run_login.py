@@ -18,6 +18,7 @@ pulsar "Probar ahora" para no bloquear la interfaz).
 """
 import datetime
 import os
+import random
 import subprocess
 import sys
 import time
@@ -189,20 +190,70 @@ def notify_failure(cfg: dict, message: str) -> None:
         log(f"No se pudo mostrar la notificación de Windows: {exc}")
 
 
-def ensure_chromium_installed() -> bool:
+def ensure_chromium_installed(stream_output: bool = False) -> bool:
     """Descarga Chromium de Playwright si aún no está instalado (equivale a
-    'playwright install chromium'). Usa 'python -m playwright' (API pública y
-    estable entre versiones) en vez de internos de playwright._impl."""
+    'playwright install chromium').
+
+    En desarrollo usa 'python -m playwright'. En el .exe empaquetado
+    (PyInstaller, sys.frozen) no hay intérprete Python, así que se invoca
+    directamente el driver incluido (node + cli.js), que es lo mismo que
+    ejecuta 'python -m playwright' por dentro.
+
+    Con stream_output=True la salida del instalador se hereda (se ve el
+    progreso en la consola) en vez de capturarse; lo usa el modo
+    --install-chromium que la GUI lanza en una ventana CMD visible."""
     try:
         log("Chromium no está instalado; descargándolo (puede tardar uno o dos minutos)...")
-        result = subprocess.run(
-            [sys.executable, "-m", "playwright", "install", "chromium"],
-            capture_output=True, text=True, timeout=600,
-        )
+        if getattr(sys, "frozen", False):
+            try:
+                from playwright._impl._driver import compute_driver_executable, get_driver_env
+            except Exception as exc:
+                log(f"No se pudo localizar el instalador interno de Playwright: {exc}")
+                return False
+            try:
+                driver_exe, driver_cli = compute_driver_executable()
+            except Exception as exc:
+                log(f"No se encontró el driver de Playwright dentro del .exe: {exc}")
+                return False
+            cmd = [driver_exe, driver_cli, "install", "chromium"]
+            merged_env = os.environ.copy()
+            try:
+                merged_env.update(get_driver_env())
+            except Exception:
+                pass
+            # PLAYWRIGHT_BROWSERS_PATH ya está en os.environ (se fijó al
+            # arrancar); se propaga vía merged_env para que el driver
+            # descargue en la misma carpeta que luego usa el launch.
+            if stream_output:
+                print("Descargando Chromium de Playwright (puede tardar uno o dos minutos)...")
+                result = subprocess.run(cmd, timeout=600, env=merged_env)
+            else:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True, text=True, timeout=600, env=merged_env,
+                )
+        else:
+            cmd = [sys.executable, "-m", "playwright", "install", "chromium"]
+            if stream_output:
+                print("Descargando Chromium de Playwright (puede tardar uno o dos minutos)...")
+                result = subprocess.run(cmd, timeout=600)
+            else:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True, text=True, timeout=600,
+                )
         if result.returncode != 0:
-            log(f"La descarga de Chromium terminó con errores: {(result.stderr or result.stdout).strip()}")
+            detail = ""
+            if not stream_output:
+                detail = (result.stderr or result.stdout or "").strip()
+            if detail:
+                log(f"La descarga de Chromium terminó con errores: {detail}")
+            else:
+                log(f"La descarga de Chromium terminó con errores (código {result.returncode}).")
             return False
         log("Chromium instalado correctamente.")
+        if stream_output:
+            print("Chromium instalado correctamente.")
         return True
     except Exception as exc:
         log(f"No se pudo instalar Chromium automáticamente: {exc}")
@@ -212,6 +263,38 @@ def ensure_chromium_installed() -> bool:
 def backoff_wait(attempt: int, base: float = 5, cap: float = 60) -> None:
     """Espera progresiva entre reintentos (5s, 10s, 20s, ... hasta `cap`)."""
     time.sleep(min(base * (2 ** (attempt - 1)), cap))
+
+
+def parse_iso_date(value: str) -> datetime.date | None:
+    """Convierte 'YYYY-MM-DD' en date, o None si está vacío o es inválido."""
+    value = (value or "").strip()
+    if not value:
+        return None
+    try:
+        return datetime.date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def check_schedule_dates(cfg: dict, today: datetime.date | None = None) -> tuple[bool, str]:
+    """Comprueba la vigencia por fechas de la tarea.
+
+    Devuelve (dentro_de_vigencia, motivo). Sin fechas configuradas siempre
+    está vigente. Una fecha inválida se ignora (no bloquea) pero se avisa."""
+    today = today or datetime.date.today()
+    start_raw = (cfg.get("schedule_start_date") or "").strip()
+    end_raw = (cfg.get("schedule_end_date") or "").strip()
+    start = parse_iso_date(start_raw) if start_raw else None
+    end = parse_iso_date(end_raw) if end_raw else None
+    if start_raw and start is None:
+        log(f"AVISO: fecha de inicio '{start_raw}' no válida (se ignora, usa YYYY-MM-DD).")
+    if end_raw and end is None:
+        log(f"AVISO: fecha de fin '{end_raw}' no válida (se ignora, usa YYYY-MM-DD).")
+    if start and today < start:
+        return False, f"aún no vigente (empieza el {start.isoformat()})"
+    if end and today > end:
+        return False, f"vigencia terminada (terminó el {end.isoformat()})"
+    return True, ""
 
 
 def detect_only(page, cfg: dict) -> str:
@@ -329,60 +412,248 @@ def perform_login(page, cfg: dict, expect_login_form: bool = True):
         raise
 
 
-def keep_session_alive(page, cfg: dict, pass_sel: str | None) -> None:
-    """Recarga la página periódicamente para evitar que el sitio cierre la
-    sesión por inactividad. Si detecta que la sesión caducó (vuelve a
-    aparecer el formulario de login), reintenta el login automáticamente.
-    keep_alive_duration_min = 0 significa 'indefinidamente'."""
+# Señales en URL/título de que hemos caído a una página de login.
+_LOGIN_URL_HINTS = ("login", "signin", "sign-in", "logon", "auth", "sesion", "sesión", "acceder", "iniciar")
+
+
+def is_session_expired(page, pass_sel: str | None) -> bool:
+    """Detecta sesión caducada con varias señales (no solo el campo password):
+
+    1. El campo de contraseña vuelve a ser visible, o
+    2. la URL/título contiene pistas de página de login.
+    """
+    if pass_sel:
+        try:
+            if page.locator(pass_sel).first.is_visible():
+                return True
+        except PlaywrightError:
+            pass
+    try:
+        haystack = f"{page.url} {page.title()}".lower()
+        if any(hint in haystack for hint in _LOGIN_URL_HINTS):
+            # Solo cuenta si además hay un campo de password (evita falsos
+            # positivos en páginas que mencionan "login" en su texto).
+            try:
+                if page.locator("input[type='password']").first.is_visible(timeout=2000):
+                    return True
+            except (PlaywrightError, PlaywrightTimeoutError):
+                pass
+    except PlaywrightError:
+        pass
+    return False
+
+
+def _jittered_interval(base_min: float, jitter_ratio: float = 0.15) -> float:
+    """Intervalo con variación aleatoria ±jitter para no parecer un robot con
+    cadencia exacta. Devuelve minutos."""
+    jitter = random.uniform(-jitter_ratio, jitter_ratio)
+    return max(1.0, base_min * (1 + jitter))
+
+
+def normalize_keep_alive_mode(value) -> str:
+    """Normaliza el modo de keep-alive: 'light' (actividad ligera, sin
+    recargar ni reconectar) o 'reload' (recarga completa, comportamiento
+    anterior). Cualquier valor ausente/inválido cae a 'light', que es el
+    que no genera conexiones nuevas en la plataforma."""
+    return "reload" if str(value or "").strip().lower() == "reload" else "light"
+
+
+def _light_heartbeat(page) -> bool:
+    """Actividad ligera para mantener la sesión sin generar una conexión
+    nueva en la plataforma: mueve el ratón, hace un scroll pequeño y toca
+    el DOM. No recarga la página ni re-navega. Devuelve False si la
+    pestaña ya está cerrada."""
+    try:
+        if page.is_closed():
+            return False
+        try:
+            page.mouse.move(random.randint(80, 600), random.randint(80, 400))
+            page.mouse.wheel(0, 160)
+        except PlaywrightError:
+            pass
+        try:
+            page.evaluate(
+                "() => {"
+                " window.scrollBy(0, 120);"
+                " window.dispatchEvent(new Event('mousemove'));"
+                " return document.visibilityState; }"
+            )
+        except PlaywrightError:
+            pass
+        return True
+    except PlaywrightError:
+        return False
+
+
+def _try_single_reload(page, max_retries: int = 3) -> bool:
+    """Un único reload de confirmación (fuera del ciclo normal). Se usa
+    solo cuando el modo ligero ya detectó posible caducidad dos veces
+    seguidas, para no reconectar por un falso positivo del DOM."""
+    for attempt in range(1, max_retries + 1):
+        try:
+            page.reload(wait_until="load", timeout=30000)
+            return True
+        except PlaywrightError as exc:
+            if page.is_closed():
+                return False
+            log(f"Intento {attempt}/{max_retries} de recarga de confirmación falló ({exc}); reintentando...")
+            backoff_wait(attempt)
+    return False
+
+
+def keep_session_alive(page, cfg: dict, pass_sel: str | None,
+                        context=None, session_path: str | None = None) -> None:
+    """Mantiene la sesión activa sin generar conexiones nuevas innecesarias.
+
+    Modos (campo `keep_alive_mode` por tarea):
+    - 'light' (recomendado, por defecto): cada ciclo solo hace actividad
+      ligera (ratón + scroll, sin recargar). Solo si se detecta posible
+      caducidad DOS veces seguidas (con 15 s entre ambas) se hace UN reload
+      de confirmación, y solo entonces se reintenta el login. Así un campo
+      de password transitorio en el DOM no provoca un re-login (y por tanto
+      una conexión nueva) cada intervalo.
+    - 'reload' (anterior): recarga completa la página en cada ciclo.
+
+    keep_alive_duration_min = 0 significa 'indefinidamente'. Cada ciclo lleva
+    jitter para no recargar con cadencia de robot, y se respeta la fecha de
+    fin de vigencia: si se alcanza, el mantenimiento termina solo."""
+
+    def _save_session_quietly() -> None:
+        try:
+            target = context or page.context
+            if session_path:
+                target.storage_state(path=session_path)
+            elif context is not None:
+                # Sin ruta no hay dónde guardar; no es error.
+                pass
+        except Exception as exc:
+            log(f"No se pudo actualizar el estado de la sesión tras el re-login: {exc}")
+
     interval_min = max(1, cfg.get("keep_alive_interval_min", 5))
     duration_min = cfg.get("keep_alive_duration_min", 60)
+    mode = normalize_keep_alive_mode(cfg.get("keep_alive_mode", "light"))
     max_retries = 3
+    max_relogins = 3
+    relogins = 0
 
+    mode_desc = (
+        "recarga completa ~cada"
+        if mode == "reload"
+        else "actividad ligera ~cada (sin recargar ni reconectar)"
+    )
     if duration_min:
-        log(f"Manteniendo la sesión activa: recarga cada {interval_min} min durante {duration_min} min.")
+        log(f"Manteniendo la sesión activa: {mode_desc} {interval_min} min durante {duration_min} min.")
     else:
-        log(f"Manteniendo la sesión activa: recarga cada {interval_min} min indefinidamente.")
+        log(f"Manteniendo la sesión activa: {mode_desc} {interval_min} min indefinidamente.")
 
-    elapsed = 0
+    elapsed = 0.0
     while duration_min == 0 or elapsed < duration_min:
-        time.sleep(interval_min * 60)
-        elapsed += interval_min
+        wait_min = _jittered_interval(interval_min)
+        if duration_min:
+            wait_min = min(wait_min, duration_min - elapsed)
+        time.sleep(wait_min * 60)
+        elapsed += wait_min
 
-        refreshed = False
-        for attempt in range(1, max_retries + 1):
-            try:
-                page.reload(wait_until="load", timeout=30000)
-                refreshed = True
-                break
-            except PlaywrightError as exc:
+        # La vigencia por fechas también corta el keep-alive a mitad de camino.
+        in_range, reason = check_schedule_dates(cfg)
+        if not in_range:
+            log(f"Fin del mantenimiento de sesión: {reason}.")
+            return
+
+        if page.is_closed():
+            log("Se detiene el mantenimiento de sesión: la pestaña se cerró.")
+            return
+
+        needs_relogin_check = False
+
+        if mode == "reload":
+            refreshed = False
+            for attempt in range(1, max_retries + 1):
+                try:
+                    page.reload(wait_until="load", timeout=30000)
+                    refreshed = True
+                    break
+                except PlaywrightError as exc:
+                    if page.is_closed():
+                        log("Se detiene el mantenimiento de sesión: la pestaña se cerró.")
+                        return
+                    log(f"Intento {attempt}/{max_retries} de refresco falló ({exc}); reintentando...")
+                    backoff_wait(attempt)
+
+            if not refreshed:
+                message = "No se pudo refrescar la sesión tras varios intentos; se detuvo el mantenimiento."
+                log(message)
+                notify_failure(cfg, message)
+                return
+
+            if not is_session_expired(page, pass_sel):
+                remaining = f", quedan ~{duration_min - elapsed:.0f} min" if duration_min else ""
+                log(f"Sesión refrescada y sigue activa ({elapsed:.0f} min transcurridos{remaining}).")
+                continue
+            needs_relogin_check = True
+        else:
+            # Modo ligero: sin recarga, para no registrar conexiones nuevas.
+            if not _light_heartbeat(page):
+                log("Se detiene el mantenimiento de sesión: la pestaña se cerró.")
+                return
+            if not is_session_expired(page, pass_sel):
+                remaining = f", quedan ~{duration_min - elapsed:.0f} min" if duration_min else ""
+                log(f"Sesión activa (actividad ligera, sin recargar) ({elapsed:.0f} min transcurridos{remaining}).")
+                continue
+
+            # Posible caducidad: confirmar sin reconectar todavía (anti
+            # falso positivo: un password oculto/transitorio no debe
+            # provocar un login nuevo cada intervalo).
+            log("Posible caducidad detectada; confirmando en 15 s sin reconectar (anti falso positivo)...")
+            time.sleep(15)
+            if page.is_closed():
+                log("Se detiene el mantenimiento de sesión: la pestaña se cerró.")
+                return
+            if not is_session_expired(page, pass_sel):
+                log("Falsa alarma: la sesión sigue activa tras la confirmación; no se reconecta.")
+                continue
+            log("La caducidad persiste; haciendo una única recarga de confirmación...")
+            if not _try_single_reload(page, max_retries):
                 if page.is_closed():
                     log("Se detiene el mantenimiento de sesión: la pestaña se cerró.")
                     return
-                log(f"Intento {attempt}/{max_retries} de refresco falló ({exc}); reintentando...")
-                backoff_wait(attempt)
+                message = "No se pudo confirmar la sesión tras varios intentos; se detuvo el mantenimiento."
+                log(message)
+                notify_failure(cfg, message)
+                return
+            if not is_session_expired(page, pass_sel):
+                log("La sesión sigue activa tras la recarga de confirmación; no hizo falta re-login.")
+                continue
+            needs_relogin_check = True
 
-        if not refreshed:
-            message = "No se pudo refrescar la sesión tras varios intentos; se detuvo el mantenimiento."
+        if not needs_relogin_check:
+            continue
+
+        relogins += 1
+        if relogins > max_relogins:
+            message = (
+                f"La sesión caducó {relogins - 1} veces y se superó el máximo de "
+                f"{max_relogins} re-logins; se detuvo el mantenimiento."
+            )
             log(message)
             notify_failure(cfg, message)
             return
 
-        session_expired = False
-        if pass_sel:
+        log(f"La sesión parece haber caducado ({elapsed:.0f} min transcurridos); "
+            f"re-login {relogins}/{max_relogins}...")
+        status, new_pass_sel = None, pass_sel
+        last_exc = None
+        for attempt in range(1, max_retries + 1):
             try:
-                session_expired = page.locator(pass_sel).first.is_visible()
-            except PlaywrightError:
-                session_expired = False
-
-        if not session_expired:
-            log(f"Sesión refrescada y sigue activa ({elapsed} min transcurridos).")
-            continue
-
-        log(f"La sesión parece haber caducado ({elapsed} min transcurridos); reintentando login...")
-        try:
-            status, new_pass_sel = perform_login(page, cfg)
-        except PlaywrightError as exc:
-            message = f"Error al reintentar el login automáticamente: {exc}"
+                status, new_pass_sel = perform_login(page, cfg)
+                last_exc = None
+                break
+            except (PlaywrightTimeoutError, PlaywrightError) as exc:
+                last_exc = exc
+                log(f"Re-login {relogins}, intento {attempt}/{max_retries} falló por red ({exc}); reintentando...")
+                backoff_wait(attempt)
+        if last_exc is not None:
+            message = f"Error al reintentar el login automáticamente: {last_exc}"
             log(message)
             notify_failure(cfg, message)
             return
@@ -391,18 +662,29 @@ def keep_session_alive(page, cfg: dict, pass_sel: str | None) -> None:
             log("No se puede seguir manteniendo la sesión activa: la pestaña se cerró durante el re-login.")
             return
         if status == "failed":
-            message = "El re-login automático no tuvo éxito; se detuvo el mantenimiento de sesión."
-            log(message)
-            notify_failure(cfg, message)
-            return
+            # No rendirse al primer fallo de credenciales: puede ser un error
+            # transitorio de la página; se sigue vigilando en el próximo ciclo.
+            log("El re-login no tuvo éxito; se seguirá intentando en el próximo ciclo.")
+            continue
 
         pass_sel = new_pass_sel
         log("Re-login automático correcto; la sesión se ha restablecido.")
+        _save_session_quietly()
 
     log("Fin del tiempo configurado para mantener la sesión activa.")
 
 
 def main() -> int:
+    # Modo instalación visible: lo lanza la GUI en una ventana CMD para que se
+    # vea el progreso de la descarga (no necesita task_id ni escribe logs).
+    if "--install-chromium" in sys.argv[1:] or "--ensure-chromium" in sys.argv[1:]:
+        ok = ensure_chromium_installed(stream_output=True)
+        if not ok:
+            try:
+                print("ERROR: no se pudo descargar Chromium. Revisa tu conexión e inténtalo de nuevo.")
+            except Exception:
+                pass
+        return 0 if ok else 1
     if len(sys.argv) < 2:
         try:
             print("Uso: python run_login.py <task_id> [--no-keep-alive] [--detect-only]", file=sys.stderr)
@@ -419,115 +701,164 @@ def main() -> int:
         log(f"ERROR: no existe ninguna tarea guardada con id '{task_id}'.")
         return 1
 
+    in_range, range_reason = check_schedule_dates(cfg)
+    if not in_range and not detect_only_mode:
+        # Fuera de vigencia: no es un fallo, simplemente no toca ejecutar.
+        # Se registra como éxito para no pintar la fila en rojo ni notificar.
+        message = f"Tarea omitida: {range_reason}."
+        log(message)
+        config_store.save_last_result(task_id, True, message)
+        return 0
+
     screenshot_path = config_store.screenshot_path(task_id)
     session_path = config_store.session_state_path(task_id)
     has_saved_session = os.path.exists(session_path)
 
-    with sync_playwright() as p:
-        launch_kwargs = dict(
-            headless=cfg.get("headless", True),
-            args=["--disable-blink-features=AutomationControlled"],
-        )
-        try:
-            browser = p.chromium.launch(**launch_kwargs)
-        except PlaywrightError as exc:
-            if "Executable doesn't exist" not in str(exc) or not ensure_chromium_installed():
-                raise
-            browser = p.chromium.launch(**launch_kwargs)
-        context = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            ),
-            storage_state=session_path if has_saved_session else None,
-        )
-        page = context.new_page()
-        try:
-            if detect_only_mode:
-                status = detect_only(page, cfg)
-                if status == "failed":
-                    page.screenshot(path=screenshot_path)
-                    log(f"Captura guardada en {screenshot_path}")
-                return 0 if status == "success" else 1
-
-            # Reintenta el login inicial ante fallos de red/navegación (no ante
-            # credenciales rechazadas, para no arriesgar bloqueos por reintentos).
-            max_initial_retries = 3
-            status = pass_sel = None
-            last_exc = None
-            for attempt in range(1, max_initial_retries + 1):
+    browser = None
+    try:
+        with sync_playwright() as p:
+            launch_kwargs = dict(
+                headless=cfg.get("headless", True),
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            try:
+                browser = p.chromium.launch(**launch_kwargs)
+            except PlaywrightError as exc:
+                if "Executable doesn't exist" not in str(exc):
+                    raise
+                if not ensure_chromium_installed():
+                    raise RuntimeError(
+                        "No se encontró el navegador Chromium de Playwright y la descarga "
+                        "automática falló. Revisa el log para ver el detalle, comprueba tu "
+                        "conexión a internet y vuelve a pulsar 'Probar ahora'."
+                    )
                 try:
-                    status, pass_sel = perform_login(page, cfg, expect_login_form=not has_saved_session)
-                    last_exc = None
-                    break
-                except (PlaywrightTimeoutError, PlaywrightError) as exc:
-                    last_exc = exc
-                    if attempt < max_initial_retries:
-                        log(
-                            f"Intento {attempt}/{max_initial_retries} de login falló por un error "
-                            f"de red/navegación ({exc}); reintentando..."
-                        )
-                        backoff_wait(attempt)
-            if last_exc is not None:
-                raise last_exc
+                    browser = p.chromium.launch(**launch_kwargs)
+                except PlaywrightError as exc2:
+                    raise RuntimeError(
+                        f"No se pudo iniciar Chromium incluso tras descargarlo: {exc2}"
+                    )
+            context = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                ),
+                storage_state=session_path if has_saved_session else None,
+            )
+            page = context.new_page()
+            try:
+                if detect_only_mode:
+                    status = detect_only(page, cfg)
+                    if status == "failed":
+                        page.screenshot(path=screenshot_path)
+                        log(f"Captura guardada en {screenshot_path}")
+                    return 0 if status == "success" else 1
 
-            if status == "failed":
-                hints = collect_error_hints(page)
-                page.screenshot(path=screenshot_path)
-                log("AVISO: tras enviar el formulario sigue visible el campo de contraseña.")
-                log(f"URL actual: {page.url} | Título: {page.title()}")
-                if hints:
-                    log(f"Posible mensaje de error en la página: {hints}")
-                log(f"Captura guardada en {screenshot_path} (ábrela para ver qué muestra la página).")
-                message = "Login fallido: credenciales rechazadas o formulario seguía visible."
+                # Reintenta el login inicial ante fallos de red/navegación (no ante
+                # credenciales rechazadas, para no arriesgar bloqueos por reintentos).
+                max_initial_retries = 3
+                status = pass_sel = None
+                last_exc = None
+                for attempt in range(1, max_initial_retries + 1):
+                    try:
+                        status, pass_sel = perform_login(page, cfg, expect_login_form=not has_saved_session)
+                        last_exc = None
+                        break
+                    except (PlaywrightTimeoutError, PlaywrightError) as exc:
+                        last_exc = exc
+                        if attempt < max_initial_retries:
+                            log(
+                                f"Intento {attempt}/{max_initial_retries} de login falló por un error "
+                                f"de red/navegación ({exc}); reintentando..."
+                            )
+                            backoff_wait(attempt)
+                if last_exc is not None:
+                    raise last_exc
+
+                if status == "failed":
+                    hints = collect_error_hints(page)
+                    page.screenshot(path=screenshot_path)
+                    log("AVISO: tras enviar el formulario sigue visible el campo de contraseña.")
+                    log(f"URL actual: {page.url} | Título: {page.title()}")
+                    if hints:
+                        log(f"Posible mensaje de error en la página: {hints}")
+                    log(f"Captura guardada en {screenshot_path} (ábrela para ver qué muestra la página).")
+                    message = "Login fallido: credenciales rechazadas o formulario seguía visible."
+                    config_store.save_last_result(task_id, False, message)
+                    if not no_keep_alive:
+                        notify_failure(cfg, message)
+                    return 1
+
+                # Login correcto (o pestaña cerrada tras el envío, que en varios
+                # sitios también significa éxito): guarda la sesión para la
+                # próxima ejecución.
+                try:
+                    context.storage_state(path=session_path)
+                except Exception as exc:
+                    log(f"No se pudo guardar el estado de la sesión: {exc}")
+
+                if status == "closed":
+                    if cfg.get("keep_alive") and not no_keep_alive:
+                        log("No se puede mantener la sesión activa: la pestaña ya está cerrada.")
+                    config_store.save_last_result(task_id, True, "Login OK (la pestaña se cerró tras enviar el formulario).")
+                    return 0
+
+                if cfg.get("keep_alive") and not no_keep_alive:
+                    if not cfg.get("keep_alive_duration_min", 60):
+                        log("AVISO: keep-alive indefinido (0:00): este proceso quedará vivo "
+                            "con actividad periódica hasta que se detenga la tarea programada.")
+                    keep_session_alive(page, cfg, pass_sel, context=context, session_path=session_path)
+                config_store.save_last_result(task_id, True, "Login completado correctamente.")
+                return 0
+            except Exception as exc:
+                log(f"ERROR inesperado: {exc}")
+                try:
+                    log(traceback.format_exc().strip())
+                except Exception:
+                    pass
+                try:
+                    if not page.is_closed():
+                        page.screenshot(path=screenshot_path)
+                        log(f"Captura guardada en {screenshot_path}")
+                except Exception:
+                    pass
+                message = f"Error inesperado: {exc}"
                 config_store.save_last_result(task_id, False, message)
                 if not no_keep_alive:
                     notify_failure(cfg, message)
                 return 1
-
-            # Login correcto (o pestaña cerrada tras el envío, que en varios
-            # sitios también significa éxito): guarda la sesión para la
-            # próxima ejecución.
-            try:
-                context.storage_state(path=session_path)
-            except Exception as exc:
-                log(f"No se pudo guardar el estado de la sesión: {exc}")
-
-            if status == "closed":
-                if cfg.get("keep_alive") and not no_keep_alive:
-                    log("No se puede mantener la sesión activa: la pestaña ya está cerrada.")
-                config_store.save_last_result(task_id, True, "Login OK (la pestaña se cerró tras enviar el formulario).")
-                return 0
-
-            if cfg.get("keep_alive") and not no_keep_alive:
-                if not cfg.get("keep_alive_duration_min", 60):
-                    log("AVISO: keep-alive indefinido (0:00): este proceso quedará vivo "
-                        "recargando la página hasta que se detenga la tarea programada.")
-                keep_session_alive(page, cfg, pass_sel)
-            config_store.save_last_result(task_id, True, "Login completado correctamente.")
-            return 0
-        except Exception as exc:
-            log(f"ERROR inesperado: {exc}")
-            try:
-                log(traceback.format_exc().strip())
-            except Exception:
-                pass
-            try:
-                if not page.is_closed():
-                    page.screenshot(path=screenshot_path)
-                    log(f"Captura guardada en {screenshot_path}")
-            except Exception:
-                pass
-            message = f"Error inesperado: {exc}"
+            finally:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+    except Exception as exc:
+        # Fallos de arranque (Chromium ausente y no descargable, sync_playwright,
+        # new_context...). Antes se propagaban y el .exe --windowed mostraba el
+        # diálogo críptico "Unhandled exception in script / Failed to execute
+        # script 'run_login'". Ahora se registran en el log y se devuelve 1
+        # para que la GUI muestre un aviso legible en vez de ese diálogo.
+        log(f"ERROR inesperado: {exc}")
+        try:
+            log(traceback.format_exc().strip())
+        except Exception:
+            pass
+        message = f"Error inesperado: {exc}"
+        try:
             config_store.save_last_result(task_id, False, message)
+        except Exception:
+            pass
+        try:
             if not no_keep_alive:
                 notify_failure(cfg, message)
-            return 1
-        finally:
-            try:
+        except Exception:
+            pass
+        try:
+            if browser is not None:
                 browser.close()
-            except Exception:
-                pass
+        except Exception:
+            pass
+        return 1
 
 
 if __name__ == "__main__":

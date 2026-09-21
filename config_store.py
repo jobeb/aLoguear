@@ -152,6 +152,8 @@ def _migrate_old_config() -> None:
             "submit_selector": old.get("submit_selector", ""),
             "schedule_time": old.get("schedule_time", "08:00"),
             "schedule_days": old.get("schedule_days", []),
+            "schedule_start_date": old.get("schedule_start_date", ""),
+            "schedule_end_date": old.get("schedule_end_date", ""),
         }
         _write_tasks([entry])
     except (OSError, json.JSONDecodeError, ValueError):
@@ -160,6 +162,41 @@ def _migrate_old_config() -> None:
 
 def log_path(task_id: str) -> str:
     return os.path.join(_log_dir(), f"{task_id}.log")
+
+
+# Registro general de la aplicación (para depuración): todo lo que no es de
+# una tarea concreta (arranques, errores de la GUI, programación, pruebas,
+# actualizaciones...). Los logs por tarea siguen en <task_id>.log.
+_APP_LOG_NAME = "app.log"
+_APP_LOG_LINES_KEPT_ON_ROTATE = 2000
+
+
+def app_log_path() -> str:
+    return os.path.join(_log_dir(), _APP_LOG_NAME)
+
+
+def write_app_log(message: str) -> None:
+    """Añade una línea al registro general de la app, con rotación por tamaño.
+    Nunca lanza excepciones (el propio registro no puede romper la app)."""
+    try:
+        log_dir = _log_dir()
+        os.makedirs(log_dir, exist_ok=True)
+        path = app_log_path()
+        try:
+            max_mb = load_settings().get("log_max_mb", 2)
+            max_bytes = max(1, max_mb) * 1024 * 1024
+            if os.path.exists(path) and os.path.getsize(path) > max_bytes:
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    lines = f.readlines()
+                with open(path, "w", encoding="utf-8") as f:
+                    f.writelines(lines[-_APP_LOG_LINES_KEPT_ON_ROTATE:])
+        except OSError:
+            pass
+        timestamp = datetime.datetime.now().isoformat(timespec="seconds")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"[{timestamp}] {message}\n")
+    except Exception:
+        pass
 
 
 def screenshot_path(task_id: str) -> str:
@@ -237,6 +274,8 @@ def get_task(task_id: str) -> dict | None:
         if not isinstance(task, dict) or task.get("id") != task_id:
             continue
         data = dict(task)
+        # Tareas antiguas sin este campo usan 'light' (no genera conexiones nuevas).
+        data["keep_alive_mode"] = _normalize_keep_alive_mode(data.get("keep_alive_mode", "light"))
         password_enc = data.get("password_enc", "")
         if not password_enc:
             data["password"] = ""
@@ -249,12 +288,19 @@ def get_task(task_id: str) -> dict | None:
     return None
 
 
+def _normalize_keep_alive_mode(value) -> str:
+    """'light' (sin recargar, no genera conexiones nuevas) o 'reload'.
+    Por defecto 'light' para tareas antiguas sin el campo."""
+    return "reload" if str(value or "").strip().lower() == "reload" else "light"
+
+
 def save_task(task_id: str | None, name: str, url: str, username: str, password: str,
               headless: bool, user_selector: str = "", pass_selector: str = "",
               submit_selector: str = "", schedule_time: str = "08:00",
               schedule_days: list | None = None, keep_alive: bool = False,
               keep_alive_interval_min: int = 5, keep_alive_duration_min: int = 60,
-              active: bool = True) -> str:
+              active: bool = True, schedule_start_date: str = "",
+              schedule_end_date: str = "", keep_alive_mode: str = "light") -> str:
     tasks = load_tasks()
     if password:
         encrypted = crypto_utils.protect(password)
@@ -274,9 +320,12 @@ def save_task(task_id: str | None, name: str, url: str, username: str, password:
         "submit_selector": submit_selector,
         "schedule_time": schedule_time,
         "schedule_days": schedule_days if schedule_days is not None else [],
+        "schedule_start_date": schedule_start_date or "",
+        "schedule_end_date": schedule_end_date or "",
         "keep_alive": keep_alive,
         "keep_alive_interval_min": keep_alive_interval_min,
         "keep_alive_duration_min": keep_alive_duration_min,
+        "keep_alive_mode": _normalize_keep_alive_mode(keep_alive_mode),
         "active": active,
     }
     for i, t in enumerate(tasks):
