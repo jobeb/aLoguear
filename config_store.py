@@ -279,8 +279,9 @@ def get_task(task_id: str) -> dict | None:
         if not isinstance(task, dict) or task.get("id") != task_id:
             continue
         data = dict(task)
-        # Tareas antiguas sin este campo usan 'light' (no genera conexiones nuevas).
-        data["keep_alive_mode"] = _normalize_keep_alive_mode(data.get("keep_alive_mode", "light"))
+        # Tareas antiguas sin este campo usan 'fetch' (mantiene la sesión
+        # sin registrar conexiones nuevas).
+        data["keep_alive_mode"] = _normalize_keep_alive_mode(data.get("keep_alive_mode", "fetch"))
         password_enc = data.get("password_enc", "")
         if not password_enc:
             data["password"] = ""
@@ -294,9 +295,14 @@ def get_task(task_id: str) -> dict | None:
 
 
 def _normalize_keep_alive_mode(value) -> str:
-    """'light' (sin recargar, no genera conexiones nuevas) o 'reload'.
-    Por defecto 'light' para tareas antiguas sin el campo."""
-    return "reload" if str(value or "").strip().lower() == "reload" else "light"
+    """'fetch' (petición ligera, por defecto), 'light' (solo actividad
+    local) o 'reload' (recarga completa)."""
+    v = str(value or "").strip().lower()
+    if v == "reload":
+        return "reload"
+    if v == "light":
+        return "light"
+    return "fetch"
 
 
 def save_task(task_id: str | None, name: str, url: str, username: str, password: str,
@@ -307,7 +313,7 @@ def save_task(task_id: str | None, name: str, url: str, username: str, password:
               keep_alive_url: str = "", keep_alive_time_from: str = "",
               keep_alive_time_to: str = "",
               active: bool = True, schedule_start_date: str = "",
-              schedule_end_date: str = "", keep_alive_mode: str = "light") -> str:
+              schedule_end_date: str = "", keep_alive_mode: str = "fetch") -> str:
     tasks = load_tasks()
     if password:
         encrypted = crypto_utils.protect(password)

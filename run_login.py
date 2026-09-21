@@ -13,8 +13,9 @@ si algo falla, guarda una captura (logs/<task_id>_error.png) para diagnosticarlo
 Si la tarea tiene activado "mantener sesión activa", tras un login exitoso
 el proceso se queda manteniendo la sesión (en vez de cerrar el navegador
 enseguida) para evitar que el sitio la cierre por inactividad: en modo
-"light" (por defecto) con actividad ligera sin recargar (no genera
-conexiones nuevas), o en modo "reload" recargando la página periódicamente.
+"fetch" (por defecto) con una petición ligera al servidor sin recargar
+(no genera conexiones nuevas), en modo "light" solo con actividad local,
+o en modo "reload" recargando la página periódicamente.
 --no-keep-alive lo desactiva puntualmente (lo usan las ejecuciones al
 instante desde la GUI).
 """
@@ -624,11 +625,72 @@ def _keep_alive_summary(stats: dict, work_page: str = "") -> str:
 
 
 def normalize_keep_alive_mode(value) -> str:
-    """Normaliza el modo de keep-alive: 'light' (actividad ligera, sin
-    recargar ni reconectar) o 'reload' (recarga completa, comportamiento
-    anterior). Cualquier valor ausente/inválido cae a 'light', que es el
-    que no genera conexiones nuevas en la plataforma."""
-    return "reload" if str(value or "").strip().lower() == "reload" else "light"
+    """Normaliza el modo de keep-alive:
+    - 'fetch' (por defecto): petición ligera al servidor con las cookies de
+      la sesión, sin recargar ni navegar. Mantiene viva la sesión en
+      plataformas que miden la inactividad por última petición (p. ej.
+      Moodle) sin registrar conexiones nuevas.
+    - 'light': solo actividad local (ratón/scroll), cero peticiones. Solo
+      sirve en sitios con temporizador de inactividad en JavaScript.
+    - 'reload': recarga completa la página en cada ciclo (comportamiento
+      anterior; algunos sitios lo exigen, pero la plataforma puede contarlo
+      como una conexión nueva cada vez)."""
+    v = str(value or "").strip().lower()
+    if v == "reload":
+        return "reload"
+    if v == "light":
+        return "light"
+    return "fetch"
+
+
+_FETCH_HEARTBEAT_JS = """async () => {
+  const url = window.location.href.split('#')[0];
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 25000);
+  try {
+    const r = await fetch(url, {method: 'GET', credentials: 'same-origin',
+      cache: 'no-store', redirect: 'follow', signal: ctrl.signal});
+    const text = await r.text();
+    const looksLogin = /<input[^>]*type=["']?password["']?/i.test(text)
+      && /login|log-in|signin|sign-in|acceder|iniciar sesi/i.test(text);
+    return 'http ' + r.status + (looksLogin ? ' login-page' : ' ok');
+  } catch (e) {
+    return 'error: ' + (e && e.message ? e.message : e);
+  } finally {
+    clearTimeout(timer);
+  }
+}"""
+
+
+def _fetch_heartbeat(page) -> tuple[bool, str]:
+    """Toque ligero al servidor en el contexto de la página (con sus
+    cookies): una petición GET que actualiza la última actividad de la
+    sesión sin navegar, recargar ni re-loguear. Devuelve (sigue_viva,
+    detalle): sigue_viva es False si la pestaña está cerrada o si la
+    respuesta parece una página de login (sesión caducada). Tolera páginas
+    sin evaluate (tests): entonces solo hace actividad local."""
+    try:
+        try:
+            closed = page.is_closed()
+        except Exception:
+            closed = False
+        if closed:
+            return False, "pestaña cerrada"
+        evaluate = getattr(page, "evaluate", None)
+        if not callable(evaluate):
+            _light_heartbeat(page)
+            return True, "sin fetch (actividad local)"
+        try:
+            result = str(evaluate(_FETCH_HEARTBEAT_JS) or "").strip()
+        except (PlaywrightError, AttributeError) as exc:
+            return True, f"fetch falló ({exc}); se vigila por DOM"
+        if not result:
+            return True, "respuesta vacía; se vigila por DOM"
+        if "login-page" in result:
+            return False, result
+        return True, result
+    except PlaywrightError:
+        return False, "pestaña cerrada"
 
 
 def _light_heartbeat(page) -> bool:
@@ -675,12 +737,15 @@ def keep_session_alive(page, cfg: dict, pass_sel: str | None = None,
     """Mantiene la sesión activa sin generar conexiones nuevas innecesarias.
 
     Modos (campo `keep_alive_mode` por tarea):
-    - 'light' (recomendado, por defecto): cada ciclo solo hace actividad
-      ligera (ratón + scroll, sin recargar). Solo si se detecta posible
-      caducidad DOS veces seguidas (con 15 s entre ambas) se hace UN reload
-      de confirmación, y solo entonces se reintenta el login. Así un campo
-      de password transitorio en el DOM no provoca un re-login (y por tanto
-      una conexión nueva) cada intervalo.
+    - 'fetch' (recomendado, por defecto): cada ciclo hace una petición
+      ligera al servidor con las cookies de la sesión, sin recargar ni
+      navegar. Mantiene viva la sesión en plataformas que miden la
+      inactividad por última petición (p. ej. Moodle) sin registrar
+      conexiones nuevas. Si la respuesta parece una página de login, se
+      confirma antes de reconectar (anti falso positivo).
+    - 'light': solo actividad local (ratón/scroll), cero peticiones. Solo
+      evita cierres por temporizador JavaScript; NO mantiene sesiones que
+      caducan en el servidor por inactividad.
     - 'reload': recarga completa la página en cada ciclo.
 
     - keep_alive_duration_min = 0 significa 'indefinidamente' (deadline real
@@ -700,7 +765,7 @@ def keep_session_alive(page, cfg: dict, pass_sel: str | None = None,
         now_fn = datetime.datetime.now
     interval_min = max(1, _as_int(cfg.get("keep_alive_interval_min", 5), 5))
     duration_min = max(0, _as_int(cfg.get("keep_alive_duration_min", 60), 60))
-    mode = normalize_keep_alive_mode(cfg.get("keep_alive_mode", "light"))
+    mode = normalize_keep_alive_mode(cfg.get("keep_alive_mode", "fetch"))
     max_retries = 3
     frm = (cfg.get("keep_alive_time_from") or "").strip()
     to = (cfg.get("keep_alive_time_to") or "").strip()
@@ -733,7 +798,12 @@ def keep_session_alive(page, cfg: dict, pass_sel: str | None = None,
     except Exception:
         home_url = None
     window_txt = f" en franja {frm}→{to}" if (frm or to) else ""
-    mode_txt = "recarga" if mode == "reload" else "actividad ligera (sin recargar)"
+    if mode == "reload":
+        mode_txt = "recarga"
+    elif mode == "light":
+        mode_txt = "actividad ligera local (sin peticiones)"
+    else:
+        mode_txt = "toque ligero al servidor (sin recargar)"
     if duration_min:
         log(f"Manteniendo la sesión activa: {mode_txt} ~cada {interval_min} min durante {duration_min} min{window_txt}.")
     else:
@@ -776,7 +846,78 @@ def keep_session_alive(page, cfg: dict, pass_sel: str | None = None,
             stats["end_reason"] = "out-of-range"
             return stats
 
-        if mode == "light":
+        if mode == "fetch":
+            # Toque ligero al servidor: actualiza la última actividad de la
+            # sesión sin navegar, recargar ni reconectar (no registra
+            # conexiones nuevas en la plataforma).
+            try:
+                closed = page.is_closed()
+            except Exception:
+                closed = False
+            if closed:
+                log("Se detiene el mantenimiento de sesión: la pestaña se cerró.")
+                stats["end_reason"] = "tab-closed"
+                return stats
+            _light_heartbeat(page)  # actividad local extra, inofensiva
+            alive, detail = _fetch_heartbeat(page)
+            if alive:
+                consecutive = 0
+                stats["refreshes"] += 1
+                elapsed_min = _elapsed()
+                remaining_txt = ""
+                if deadline is not None:
+                    remaining_txt = f", quedan ~{max(0.0, (deadline - clock()) / 60):.0f} min"
+                log(f"Sesión activa (toque ligero al servidor, {detail}, sin recargar) ({elapsed_min:.0f} min transcurridos{remaining_txt}).")
+                continue
+            # Posible caducidad (la respuesta parece un login): confirmar
+            # con otra petición antes de reconectar (anti falso positivo).
+            log(f"Posible caducidad detectada ({detail}); confirmando en 15 s sin reconectar (anti falso positivo)...")
+            sleeper(15)
+            try:
+                closed = page.is_closed()
+            except Exception:
+                closed = False
+            if closed:
+                log("Se detiene el mantenimiento de sesión: la pestaña se cerró.")
+                stats["end_reason"] = "tab-closed"
+                return stats
+            alive, detail = _fetch_heartbeat(page)
+            if alive:
+                consecutive = 0
+                stats["refreshes"] += 1
+                log(f"Falsa alarma: el servidor responde ({detail}); no se reconecta.")
+                continue
+            log("La caducidad persiste; haciendo una única recarga de confirmación...")
+            refreshed = False
+            for attempt in range(1, max_retries + 1):
+                try:
+                    page.reload(wait_until="domcontentloaded", timeout=30000)
+                    refreshed = True
+                    break
+                except PlaywrightError as exc:
+                    try:
+                        closed = page.is_closed()
+                    except Exception:
+                        closed = False
+                    if closed:
+                        log("Se detiene el mantenimiento de sesión: la pestaña se cerró.")
+                        stats["end_reason"] = "tab-closed"
+                        return stats
+                    log(f"Intento {attempt}/{max_retries} de recarga de confirmación falló ({exc}); reintentando...")
+                    _backoff_sleep(attempt, sleeper)
+            if not refreshed:
+                if _failed_cycle("No se pudo confirmar la sesión tras varios intentos",
+                                 "No se pudo confirmar la sesión tras varios intentos; se detuvo el mantenimiento."):
+                    return stats
+                continue
+            if not is_session_expired(page, pass_sel, home_url):
+                consecutive = 0
+                stats["refreshes"] += 1
+                log("La sesión sigue activa tras la recarga de confirmación; no hizo falta re-login.")
+                continue
+            # Caducidad confirmada: cae al re-login común de abajo.
+            elapsed_min = _elapsed()
+        elif mode == "light":
             # Modo ligero: actividad mínima sin recargar, para no registrar
             # conexiones nuevas en la plataforma.
             try:

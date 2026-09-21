@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.5.2
+- Nuevo modo de keep-alive `Toque ligero al servidor` (ahora por defecto): petición mínima con las cookies de la sesión, sin recargar ni navegar. Mantiene viva la sesión en plataformas que miden la inactividad en el servidor (p. ej. Moodle) sin registrar conexiones nuevas; si la respuesta parece una página de login, confirma antes de reconectar. El modo `Solo actividad local` queda para sitios con temporizador JavaScript (no mantiene sesiones de servidor).
+- Corrección: en modo fetch la caducidad confirmada ya no pasa además por la rama de recarga (evita una recarga doble antes del re-login).
+
 ## 1.5.1
 - Keep-alive con modos por tarea: `Ligero` (por defecto, también para tareas antiguas) mantiene la sesión con actividad mínima de ratón/scroll sin recargar la página, así la plataforma no registra una conexión nueva en cada intervalo; `Recarga completa` conserva el comportamiento anterior para sitios que lo exijan. El modo ligero solo reconecta tras doble confirmación (anti falso positivo: un campo de contraseña transitorio ya no provoca un re-login cada ciclo).
 - `Probar ahora` ejecuta una prueba real con keep-alive en segundo plano (igual que la tarea programada): el botón cambia a `Detener prueba` mientras corre y la app no deja runners colgados al salir.

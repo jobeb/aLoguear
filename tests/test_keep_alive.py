@@ -62,8 +62,10 @@ class FakeLocator:
     def fill(self, value):
         self._page.filled[self._selector] = value
         if "password" in self._selector.lower() and self._page.cure_on_fill:
-            # Simula que el login cura la página: desaparece el formulario.
+            # Simula que el login cura la página: desaparece el formulario y
+            # el servidor vuelve a servir páginas normales (no la de login).
             self._page.password_visible = False
+            self._page.serve_login_page = False
 
     def press(self, _key):
         pass
@@ -102,12 +104,14 @@ class FakeMouse:
 
 class FakePage:
     def __init__(self, url="https://app.example.com/panel", password_visible=False,
-                 body_text="", reload_fail_times=0, cure_on_fill=False):
+                 body_text="", reload_fail_times=0, cure_on_fill=False,
+                 serve_login_page=False):
         self.url = url
         self.password_visible = password_visible
         self.body_text = body_text
         self.reload_fail_times = reload_fail_times
         self.cure_on_fill = cure_on_fill
+        self.serve_login_page = serve_login_page
         self.filled = {}
         self.goto_calls = []
         self.reload_calls = 0
@@ -123,6 +127,8 @@ class FakePage:
 
     def evaluate(self, expression):
         self.eval_calls.append(expression)
+        if "fetch(" in expression:
+            return "http 200 login-page" if self.serve_login_page else "http 200 ok"
         return "visible"
 
     def locator(self, selector):
@@ -355,9 +361,50 @@ def test_light_mode_confirms_once_before_relogin(tmp_path, monkeypatch):
     assert page.filled.get("input[type='password']") == "p"
 
 
-def test_normalize_keep_alive_mode_defaults_light():
-    assert run_login.normalize_keep_alive_mode("") == "light"
-    assert run_login.normalize_keep_alive_mode(None) == "light"
-    assert run_login.normalize_keep_alive_mode("ligero") == "light"
+def test_normalize_keep_alive_mode_defaults_fetch():
+    assert run_login.normalize_keep_alive_mode("") == "fetch"
+    assert run_login.normalize_keep_alive_mode(None) == "fetch"
+    assert run_login.normalize_keep_alive_mode("raro") == "fetch"
+    assert run_login.normalize_keep_alive_mode("light") == "light"
     assert run_login.normalize_keep_alive_mode("reload") == "reload"
     assert run_login.normalize_keep_alive_mode("RELOAD") == "reload"
+
+
+# --- modo fetch (petición ligera): mantiene la sesión sin recargar ---
+
+def test_fetch_mode_healthy_touches_server_without_reload(monkeypatch):
+    monkeypatch.setattr(run_login, "notify_failure", lambda cfg, msg: None)
+    page = FakePage()
+    stats = run_login.keep_session_alive(
+        page, base_cfg(keep_alive_mode="fetch"), "input[type='password']",
+        sleeper=noop, clock=FakeClock(), now_fn=lambda: datetime.datetime(2026, 9, 17, 10, 0),
+    )
+    assert stats["end_reason"] == "finished"
+    assert stats["refreshes"] >= 1
+    assert stats["failures"] == 0 and stats["relogins"] == 0
+    assert page.reload_calls == 0  # ninguna recarga: ninguna conexión nueva
+    assert any("fetch(" in call for call in page.eval_calls)
+
+
+def test_fetch_mode_confirms_once_before_relogin(tmp_path, monkeypatch):
+    monkeypatch.setattr(run_login, "notify_failure", lambda cfg, msg: None)
+    session_file = str(tmp_path / "s.json")
+    page = FakePage(url="https://app.example.com/login", password_visible=True,
+                    cure_on_fill=True, serve_login_page=True)
+    stats = run_login.keep_session_alive(
+        page, base_cfg(keep_alive_mode="fetch"), "input[type='password']",
+        session_path=session_file,
+        sleeper=noop, clock=FakeClock(), now_fn=lambda: datetime.datetime(2026, 9, 17, 10, 0),
+    )
+    assert stats["relogins"] == 1
+    assert stats["end_reason"] == "finished"
+    assert page.reload_calls == 1  # una única recarga de confirmación
+    assert page.context.saved_to == [session_file]
+    assert page.filled.get("input[type='password']") == "p"
+
+
+def test_fetch_heartbeat_reports_login_page():
+    alive, detail = run_login._fetch_heartbeat(FakePage())
+    assert alive is True and "http 200 ok" in detail
+    alive, detail = run_login._fetch_heartbeat(FakePage(serve_login_page=True))
+    assert alive is False and "login-page" in detail

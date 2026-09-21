@@ -91,10 +91,15 @@ _EXPORT_FIELDS = [
 
 
 def normalize_keep_alive_mode(value) -> str:
-    """Normaliza el modo de keep-alive: 'light' (actividad ligera, sin
-    recargar ni generar conexiones nuevas) o 'reload' (recarga completa).
-    Cualquier valor ausente/inválido cae a 'light'."""
-    return "reload" if str(value or "").strip().lower() == "reload" else "light"
+    """Normaliza el modo de keep-alive: 'fetch' (petición ligera, por
+    defecto), 'light' (solo actividad local) o 'reload' (recarga completa).
+    Cualquier valor ausente/inválido cae a 'fetch'."""
+    v = str(value or "").strip().lower()
+    if v == "reload":
+        return "reload"
+    if v == "light":
+        return "light"
+    return "fetch"
 
 
 def _days_display(day_names: list) -> str:

@@ -54,7 +54,8 @@ except Exception:
     _tray_toast = None
 
 KEEP_ALIVE_MODES = (
-    ("light", "Ligero (recomendado): sin recargar, no genera conexiones nuevas"),
+    ("fetch", "Toque ligero al servidor (recomendado): mantiene la sesión sin recargar"),
+    ("light", "Solo actividad local: sin peticiones (solo anti temporizador JS)"),
     ("reload", "Recarga completa: como antes (puede registrar conexiones)"),
 )
 
@@ -63,7 +64,9 @@ def _normalize_keep_alive_mode_gui(value) -> str:
     v = str(value or "").strip().lower()
     if v == "reload" or "recarga completa" in v:
         return "reload"
-    return "light"
+    if v == "light" or "solo actividad local" in v:
+        return "light"
+    return "fetch"
 
 
 def _keep_alive_mode_label(mode: str) -> str:
@@ -805,7 +808,7 @@ class App(tk.Tk):
             keep_alive_chk,
             "Tras iniciar sesión, mantiene la sesión activa para evitar que el "
             "sitio la cierre por inactividad (y reintenta el login si caduca).\n"
-            "El modo Ligero no recarga ni genera conexiones nuevas.\n"
+            "El toque ligero al servidor no genera conexiones nuevas.\n"
             "Ojo: duración 0:00 = indefinido, el runner queda vivo para siempre y ocupa "
             "su tarea programada.",
         )
@@ -820,7 +823,7 @@ class App(tk.Tk):
         ttk.Label(self.keep_alive_frame, text="MODO", style="Field.TLabel").grid(
             row=0, column=0, columnspan=3, sticky="w"
         )
-        self.keep_alive_mode_var = tk.StringVar(value=_keep_alive_mode_label("light"))
+        self.keep_alive_mode_var = tk.StringVar(value=_keep_alive_mode_label("fetch"))
         ka_mode_combo = ttk.Combobox(
             self.keep_alive_frame, textvariable=self.keep_alive_mode_var,
             values=[label for _, label in KEEP_ALIVE_MODES],
@@ -829,9 +832,13 @@ class App(tk.Tk):
         ka_mode_combo.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(4, 0))
         ToolTip(
             ka_mode_combo,
-            "Ligero: mantiene la sesión con actividad mínima (ratón/scroll), sin recargar\n"
-            "la página y sin generar conexiones nuevas. Solo reconecta si la sesión\n"
-            "caducó de verdad (doble confirmación).\n\n"
+            "Toque ligero: petición mínima al servidor con tus cookies, sin recargar\n"
+            "ni navegar. Mantiene la sesión (aunque el sitio mida la inactividad en\n"
+            "el servidor) sin generar conexiones nuevas. Solo reconecta si la\n"
+            "sesión caducó de verdad (doble confirmación).\n\n"
+            "Solo actividad local: ratón/scroll sin ninguna petición. Solo sirve\n"
+            "si el sitio cierra por temporizador JavaScript; no mantiene sesiones\n"
+            "que caducan en el servidor.\n\n"
             "Recarga completa: comportamiento anterior, recarga la página en cada\n"
             "intervalo. Algunos sitios lo exigen, pero la plataforma puede contarlo\n"
             "como una conexión nueva cada vez.",
@@ -849,8 +856,8 @@ class App(tk.Tk):
         ToolTip(
             ka_interval_spin,
             "Cada cuántos minutos hay actividad de mantenimiento.\n"
-            "En modo ligero no recarga (sin conexiones nuevas); en recarga completa\n"
-            "recarga la página. Lleva variación aleatoria para no parecer un robot.",
+            "El toque ligero mantiene la sesión sin recargar (sin conexiones nuevas).\n"
+            "Lleva variación aleatoria para no parecer un robot.",
         )
         ttk.Label(refresh_row, text="min", style="Card.TLabel").grid(
             row=0, column=2, sticky="w"
@@ -2043,7 +2050,7 @@ class App(tk.Tk):
                     keep_alive_time_from=ka_from,
                     keep_alive_time_to=ka_to,
                     keep_alive_mode=_normalize_keep_alive_mode_gui(
-                        entry.get("keep_alive_mode", "light")
+                        entry.get("keep_alive_mode", "fetch")
                     ),
                     active=False,
                 )
@@ -2112,7 +2119,7 @@ class App(tk.Tk):
             keep_alive_url=data.get("keep_alive_url", ""),
             keep_alive_time_from=data.get("keep_alive_time_from", ""),
             keep_alive_time_to=data.get("keep_alive_time_to", ""),
-            keep_alive_mode=data.get("keep_alive_mode", "light"),
+            keep_alive_mode=data.get("keep_alive_mode", "fetch"),
             active=active,
         )
         return True
@@ -2370,7 +2377,7 @@ class App(tk.Tk):
         self.active_var.set(True)
         self.headless_var.set(True)
         self.keep_alive_var.set(False)
-        self.keep_alive_mode_var.set(_keep_alive_mode_label("light"))
+        self.keep_alive_mode_var.set(_keep_alive_mode_label("fetch"))
         self.keep_alive_interval_var.set("5")
         self.keep_alive_duration_hour_var.set("01")
         self.keep_alive_duration_min_var.set("00")
@@ -2408,7 +2415,7 @@ class App(tk.Tk):
         self.headless_var.set(data.get("headless", True))
         self.keep_alive_var.set(data.get("keep_alive", False))
         self.keep_alive_mode_var.set(
-            _keep_alive_mode_label(data.get("keep_alive_mode", "light"))
+            _keep_alive_mode_label(data.get("keep_alive_mode", "fetch"))
         )
         self.keep_alive_interval_var.set(str(data.get("keep_alive_interval_min", 5)))
         self.keep_alive_url_var.set((data.get("keep_alive_url") or "").strip())

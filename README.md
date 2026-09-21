@@ -16,8 +16,9 @@ sesión activa (por ejemplo, campus virtuales de formación).
 - Vigencia por fechas: cada tarea puede tener fecha de inicio y fin (YYYY-MM-DD);
   fuera de rango el runner se omite sin marcar fallo, y el Programador de Windows
   también deja de dispararla.
-- Opción de "mantener la sesión activa" tras el login, con modos ligero (sin
-  recargar, no genera conexiones nuevas) o recarga completa, deadline real,
+- Opción de "mantener la sesión activa" tras el login, con modos por tarea
+  (toque ligero al servidor sin recargar —no genera conexiones nuevas—,
+  solo actividad local, o recarga completa), deadline real,
   espera por tramos con fin de vigencia reactivo, re-login con
   reintentos (abandona solo tras 3 fallos seguidos), sesión guardada en cada
   re-login, resultado honesto en el historial y franja horaria opcional
