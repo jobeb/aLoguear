@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.6.0
+- Nuevo modo de keep-alive `Visitar página de trabajo` (`work`): navegación completa a `keep_alive_url` (o a la página tras el login si no hay) en cada ciclo. Para sitios donde la sesión se sigue cerrando con `fetch` (XHR ignorado) o `reload` (recarga lo que haya): vuelve siempre a una URL conocida-buena, re-ejecuta su JS y renueva tokens; si caduca, re-login automático igual que el resto de modos.
+- Corrección: en modo visible el viewport de Playwright era fijo (1280x720) y la página no se redimensionaba al maximizar/achicar la ventana; ahora usa `viewport=None` para que siga a la ventana (en headless se mantiene fijo para capturas deterministas).
+
 ## 1.5.2
 - Nuevo modo de keep-alive `Toque ligero al servidor` (ahora por defecto): petición mínima con las cookies de la sesión, sin recargar ni navegar. Mantiene viva la sesión en plataformas que miden la inactividad en el servidor (p. ej. Moodle) sin registrar conexiones nuevas; si la respuesta parece una página de login, confirma antes de reconectar. El modo `Solo actividad local` queda para sitios con temporizador JavaScript (no mantiene sesiones de servidor).
 - Corrección: en modo fetch la caducidad confirmada ya no pasa además por la rama de recarga (evita una recarga doble antes del re-login).

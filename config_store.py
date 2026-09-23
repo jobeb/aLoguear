@@ -296,12 +296,15 @@ def get_task(task_id: str) -> dict | None:
 
 def _normalize_keep_alive_mode(value) -> str:
     """'fetch' (petición ligera, por defecto), 'light' (solo actividad
-    local) o 'reload' (recarga completa)."""
+    local), 'reload' (recarga completa) o 'work' (visita la página de
+    trabajo)."""
     v = str(value or "").strip().lower()
     if v == "reload":
         return "reload"
     if v == "light":
         return "light"
+    if v in ("work", "visit", "visita") or "visitar" in v or "work" in v:
+        return "work"
     return "fetch"
 
 

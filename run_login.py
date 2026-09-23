@@ -634,12 +634,20 @@ def normalize_keep_alive_mode(value) -> str:
       sirve en sitios con temporizador de inactividad en JavaScript.
     - 'reload': recarga completa la página en cada ciclo (comportamiento
       anterior; algunos sitios lo exigen, pero la plataforma puede contarlo
-      como una conexión nueva cada vez)."""
+      como una conexión nueva cada vez).
+    - 'work': visita la página de trabajo (`keep_alive_url`, o la URL que
+      quedó tras el login si no hay) con una navegación completa en cada
+      ciclo. Es el más fuerte cuando la sesión se sigue cerrando: a
+      diferencia del fetch (XHR que algunos sitios ignoran) y del reload
+      (recarga lo que haya, aunque sea una página de error), vuelve
+      siempre a una URL conocida-buena, re-ejecuta su JS y renueva tokens."""
     v = str(value or "").strip().lower()
     if v == "reload":
         return "reload"
     if v == "light":
         return "light"
+    if v in ("work", "visit", "visita") or "visitar" in v or "work" in v:
+        return "work"
     return "fetch"
 
 
@@ -730,6 +738,73 @@ def _light_heartbeat(page) -> bool:
         return False
 
 
+def _resolve_work_target(cfg: dict, home_url: str | None, page=None) -> str | None:
+    """URL que el modo 'work' visita en cada ciclo: `keep_alive_url` si hay,
+    si no la URL que quedó tras el login (`home_url`), si no la actual."""
+    target = (cfg.get("keep_alive_url") or "").strip()
+    if target and _is_http_url(target):
+        return target
+    if home_url:
+        return home_url
+    try:
+        return page.url if page is not None else None
+    except Exception:
+        return None
+
+
+def _visit_work_page(page, target: str | None, max_retries: int = 3,
+                     sleeper=time.sleep) -> tuple[bool, str]:
+    """Navegación completa a la página de trabajo (modo 'work').
+
+    Devuelve (ok, detalle): ok=False si la pestaña está cerrada o no se
+    pudo navegar tras los reintentos. Tolera dobles de test sin goto
+    (cae a reload si existe, si no a actividad local)."""
+    try:
+        try:
+            closed = page.is_closed()
+        except Exception:
+            closed = False
+        if closed:
+            return False, "pestaña cerrada"
+        if not target:
+            return False, "sin URL de trabajo"
+        goto = getattr(page, "goto", None)
+        if not callable(goto):
+            reload = getattr(page, "reload", None)
+            if callable(reload):
+                try:
+                    reload(wait_until="domcontentloaded", timeout=30000)
+                    return True, "sin goto (recarga)"
+                except Exception as exc:
+                    return False, f"sin goto ({exc})"
+            _light_heartbeat(page)
+            return True, "sin goto (actividad local)"
+        last_exc = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                goto(target, wait_until="domcontentloaded", timeout=30000)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=15000)
+                except (PlaywrightTimeoutError, PlaywrightError):
+                    pass
+                except Exception:
+                    pass
+                return True, target
+            except (PlaywrightTimeoutError, PlaywrightError) as exc:
+                last_exc = exc
+                try:
+                    closed = page.is_closed()
+                except Exception:
+                    closed = False
+                if closed:
+                    return False, "pestaña cerrada"
+                log(f"Intento {attempt}/{max_retries} de visita a la página de trabajo falló ({exc}); reintentando...")
+                _backoff_sleep(attempt, sleeper)
+        return False, f"no se pudo visitar ({last_exc})"
+    except PlaywrightError:
+        return False, "pestaña cerrada"
+
+
 def keep_session_alive(page, cfg: dict, pass_sel: str | None = None,
                        session_path: str | None = None,
                        sleeper=time.sleep, clock=time.monotonic,
@@ -746,7 +821,11 @@ def keep_session_alive(page, cfg: dict, pass_sel: str | None = None,
     - 'light': solo actividad local (ratón/scroll), cero peticiones. Solo
       evita cierres por temporizador JavaScript; NO mantiene sesiones que
       caducan en el servidor por inactividad.
-    - 'reload': recarga completa la página en cada ciclo.
+    - 'reload': recarga completa la página actual en cada ciclo.
+    - 'work': visita la página de trabajo (`keep_alive_url` o la URL tras
+      el login) con navegación completa en cada ciclo. El más fuerte si la
+      sesión se sigue cerrando: renueva la página de verdad en vez de un
+      XHR (fetch) o recargar lo que haya (reload).
 
     - keep_alive_duration_min = 0 significa 'indefinidamente' (deadline real
       con reloj monotónico: el tiempo cuenta re-logins y todo).
@@ -802,6 +881,9 @@ def keep_session_alive(page, cfg: dict, pass_sel: str | None = None,
         mode_txt = "recarga"
     elif mode == "light":
         mode_txt = "actividad ligera local (sin peticiones)"
+    elif mode == "work":
+        work_txt = (cfg.get("keep_alive_url") or "").strip() or "página tras el login"
+        mode_txt = f"visita a la página de trabajo ({work_txt})"
     else:
         mode_txt = "toque ligero al servidor (sin recargar)"
     if duration_min:
@@ -989,6 +1071,41 @@ def keep_session_alive(page, cfg: dict, pass_sel: str | None = None,
                 continue
             # Caducidad confirmada: cae al re-login común de abajo.
             elapsed_min = _elapsed()
+        elif mode == "work":
+            # Visita completa a la página de trabajo: navegación real (no un
+            # XHR como fetch ni recargar lo que haya como reload). Vuelve
+            # siempre a una URL conocida-buena y re-ejecuta su JS.
+            try:
+                closed = page.is_closed()
+            except Exception:
+                closed = False
+            if closed:
+                log("Se detiene el mantenimiento de sesión: la pestaña se cerró.")
+                stats["end_reason"] = "tab-closed"
+                return stats
+            _light_heartbeat(page)  # actividad local extra, inofensiva
+            target = _resolve_work_target(cfg, home_url, page)
+            ok_visit, detail = _visit_work_page(page, target, max_retries, sleeper)
+            if not ok_visit:
+                if detail == "pestaña cerrada":
+                    log("Se detiene el mantenimiento de sesión: la pestaña se cerró.")
+                    stats["end_reason"] = "tab-closed"
+                    return stats
+                if _failed_cycle(f"No se pudo visitar la página de trabajo ({detail})",
+                                 "No se pudo visitar la página de trabajo tras varios intentos; se detuvo el mantenimiento."):
+                    return stats
+                continue
+            if not is_session_expired(page, pass_sel, home_url):
+                consecutive = 0
+                stats["refreshes"] += 1
+                elapsed_min = _elapsed()
+                remaining_txt = ""
+                if deadline is not None:
+                    remaining_txt = f", quedan ~{max(0.0, (deadline - clock()) / 60):.0f} min"
+                log(f"Sesión activa (visita a la página de trabajo, sin re-login) ({elapsed_min:.0f} min transcurridos{remaining_txt}).")
+                continue
+            # Caducada de verdad: cae al re-login común de abajo.
+            elapsed_min = _elapsed()
         else:
             refreshed = False
             for attempt in range(1, max_retries + 1):
@@ -1108,8 +1225,9 @@ def main() -> int:
 
     try:
         with sync_playwright() as p:
+            headed = not cfg.get("headless", True)
             launch_kwargs = dict(
-                headless=cfg.get("headless", True),
+                headless=not headed,
                 args=["--disable-blink-features=AutomationControlled"],
             )
             try:
@@ -1129,13 +1247,21 @@ def main() -> int:
                     raise RuntimeError(
                         f"No se pudo iniciar Chromium incluso tras descargarlo: {exc2}"
                     )
-            context = browser.new_context(
+            # Sin viewport fijo en modo visible: viewport=None hace que la
+            # página siga el tamaño de la ventana (maximizar/achicar
+            # redimensiona el contenido). En headless se mantiene el
+            # viewport fijo por defecto (1280x720) para capturas y
+            # detección deterministas.
+            context_kwargs = dict(
                 user_agent=(
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
                 ),
                 storage_state=session_path if has_saved_session else None,
             )
+            if headed:
+                context_kwargs["viewport"] = None
+            context = browser.new_context(**context_kwargs)
             page = context.new_page()
             try:
                 if detect_only_mode:

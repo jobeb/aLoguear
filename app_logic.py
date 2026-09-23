@@ -92,13 +92,16 @@ _EXPORT_FIELDS = [
 
 def normalize_keep_alive_mode(value) -> str:
     """Normaliza el modo de keep-alive: 'fetch' (petición ligera, por
-    defecto), 'light' (solo actividad local) o 'reload' (recarga completa).
+    defecto), 'light' (solo actividad local), 'reload' (recarga completa)
+    o 'work' (visita la página de trabajo).
     Cualquier valor ausente/inválido cae a 'fetch'."""
     v = str(value or "").strip().lower()
     if v == "reload":
         return "reload"
     if v == "light":
         return "light"
+    if v in ("work", "visit", "visita") or "visitar" in v or "work" in v:
+        return "work"
     return "fetch"
 
 

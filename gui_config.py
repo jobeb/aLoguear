@@ -55,6 +55,7 @@ except Exception:
 
 KEEP_ALIVE_MODES = (
     ("fetch", "Toque ligero al servidor (recomendado): mantiene la sesión sin recargar"),
+    ("work", "Visitar página de trabajo: navega a la URL de trabajo cada ciclo (más fuerte)"),
     ("light", "Solo actividad local: sin peticiones (solo anti temporizador JS)"),
     ("reload", "Recarga completa: como antes (puede registrar conexiones)"),
 )
@@ -66,6 +67,8 @@ def _normalize_keep_alive_mode_gui(value) -> str:
         return "reload"
     if v == "light" or "solo actividad local" in v:
         return "light"
+    if v == "work" or "visitar" in v or "página de trabajo" in v:
+        return "work"
     return "fetch"
 
 
@@ -836,6 +839,9 @@ class App(tk.Tk):
             "ni navegar. Mantiene la sesión (aunque el sitio mida la inactividad en\n"
             "el servidor) sin generar conexiones nuevas. Solo reconecta si la\n"
             "sesión caducó de verdad (doble confirmación).\n\n"
+            "Visitar página de trabajo: navegación completa a la URL de trabajo\n"
+            "(o a la página tras el login si no hay) en cada intervalo. Es el más\n"
+            "fuerte si la sesión se sigue cerrando: renueva la página de verdad.\n\n"
             "Solo actividad local: ratón/scroll sin ninguna petición. Solo sirve\n"
             "si el sitio cierra por temporizador JavaScript; no mantiene sesiones\n"
             "que caducan en el servidor.\n\n"
