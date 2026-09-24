@@ -557,21 +557,39 @@ _KEEPALIVE_QUANTUM_SEC = 60
 _KEEPALIVE_MAX_CONSECUTIVE_FAILURES = 3
 
 
-def _wait_interruptible(cfg: dict, total_sec: float, sleeper=time.sleep) -> tuple[bool, str]:
+def _wait_interruptible(cfg: dict, total_sec: float, sleeper=time.sleep,
+                        should_stop=None) -> tuple[bool, str]:
     """Espera `total_sec` por tramos revisando la vigencia por fechas.
 
     Devuelve (True, '') si se completó, o (False, motivo) si la vigencia
-    terminó a mitad de la espera. No avisa por fechas inválidas (el aviso ya
-    se dio al arrancar) para no ensuciar el log cada minuto.
+    terminó a mitad de la espera o `should_stop()` devolvió un motivo
+    (p. ej. "pestaña cerrada": así cerrar el navegador a mano libera el
+    lock en ~60 s en vez de esperar al siguiente ciclo). No avisa por
+    fechas inválidas (el aviso ya se dio al arrancar) para no ensuciar
+    el log cada minuto.
     """
     ok, reason = _in_schedule_range(cfg, datetime.date.today())
     if not ok:
         return False, reason
+    if should_stop is not None:
+        try:
+            early = should_stop()
+        except Exception:
+            early = None
+        if early:
+            return False, early
     remaining = max(0.0, total_sec)
     while remaining > 0:
         chunk = min(_KEEPALIVE_QUANTUM_SEC, remaining)
         sleeper(chunk)
         remaining -= chunk
+        if should_stop is not None:
+            try:
+                early = should_stop()
+            except Exception:
+                early = None
+            if early:
+                return False, early
         ok, reason = _in_schedule_range(cfg, datetime.date.today())
         if not ok:
             return False, reason
@@ -894,6 +912,14 @@ def keep_session_alive(page, cfg: dict, pass_sel: str | None = None,
 
     consecutive = 0
     was_inside = None
+
+    def _tab_closed_now():
+        """Motivo de parada si el usuario cerró el navegador a mano."""
+        try:
+            return "pestaña cerrada" if page.is_closed() else None
+        except Exception:
+            return None
+
     while True:
         now = clock()
         elapsed_min = _elapsed()
@@ -912,8 +938,13 @@ def keep_session_alive(page, cfg: dict, pass_sel: str | None = None,
             if was_inside is not False:
                 log(f"Fuera de la franja horaria ({frm}→{to}); se espera sin refrescar.")
                 was_inside = False
-            ok, reason = _wait_interruptible(cfg, _KEEPALIVE_QUANTUM_SEC, sleeper)
+            ok, reason = _wait_interruptible(cfg, _KEEPALIVE_QUANTUM_SEC, sleeper,
+                                             should_stop=_tab_closed_now)
             if not ok:
+                if reason == "pestaña cerrada":
+                    log("Se detiene el mantenimiento de sesión: la pestaña se cerró.")
+                    stats["end_reason"] = "tab-closed"
+                    return stats
                 log(f"Fin del mantenimiento de sesión: {reason}.")
                 stats["end_reason"] = "out-of-range"
                 return stats
@@ -922,8 +953,13 @@ def keep_session_alive(page, cfg: dict, pass_sel: str | None = None,
             log("De nuevo dentro de la franja horaria: se reanuda el mantenimiento.")
         was_inside = True
 
-        ok, reason = _wait_interruptible(cfg, _next_wait_min(interval_min, remaining) * 60, sleeper)
+        ok, reason = _wait_interruptible(cfg, _next_wait_min(interval_min, remaining) * 60, sleeper,
+                                         should_stop=_tab_closed_now)
         if not ok:
+            if reason == "pestaña cerrada":
+                log("Se detiene el mantenimiento de sesión: la pestaña se cerró.")
+                stats["end_reason"] = "tab-closed"
+                return stats
             log(f"Fin del mantenimiento de sesión: {reason}.")
             stats["end_reason"] = "out-of-range"
             return stats
@@ -1247,7 +1283,7 @@ def main() -> int:
                     raise RuntimeError(
                         f"No se pudo iniciar Chromium incluso tras descargarlo: {exc2}"
                     )
-            # Sin viewport fijo en modo visible: viewport=None hace que la
+            # Sin viewport fijo en modo visible: no_viewport=True hace que la
             # página siga el tamaño de la ventana (maximizar/achicar
             # redimensiona el contenido). En headless se mantiene el
             # viewport fijo por defecto (1280x720) para capturas y
@@ -1260,7 +1296,7 @@ def main() -> int:
                 storage_state=session_path if has_saved_session else None,
             )
             if headed:
-                context_kwargs["viewport"] = None
+                context_kwargs["no_viewport"] = True
             context = browser.new_context(**context_kwargs)
             page = context.new_page()
             try:

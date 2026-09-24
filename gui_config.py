@@ -1151,7 +1151,11 @@ class App(tk.Tk):
             self.destroy()
 
     def destroy(self):
-        # No dejar runners de prueba colgados al salir de la app.
+        # No dejar runners de prueba colgados al salir de la app: terminate,
+        # espera breve y kill si sigue vivo (igual que Detener prueba).
+        # Nota: solo cubre la prueba lanzada desde esta GUI; las ejecuciones
+        # de tareas programadas de Windows son procesos independientes y
+        # siguen su curso (su lock anti-solape las protege).
         try:
             proc = getattr(self, "_test_process", None)
             if proc is not None and proc.poll() is None:
@@ -1159,6 +1163,23 @@ class App(tk.Tk):
                     proc.terminate()
                 except Exception:
                     pass
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        self._test_process = None
+        try:
+            if getattr(self, "tray_icon", None) is not None:
+                try:
+                    self.tray_icon.stop()
+                except Exception:
+                    pass
+                self.tray_icon = None
         except Exception:
             pass
         try:

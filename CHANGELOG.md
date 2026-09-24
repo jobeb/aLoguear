@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.6.1
+- Corrección real del redimensionado en modo visible: la 1.6.0 usaba `viewport=None` (se ignora y queda el fijo 1280x720); ahora usa `no_viewport=True`, que es lo que Playwright documenta para que la página siga a la ventana al maximizar/achicar.
+- El runner detecta la pestaña cerrada también durante la espera entre ciclos y termina en ~60 s liberando el lock (antes retenía el lock hasta el siguiente ciclo y el siguiente intento decía "ya hay otra ejecución en curso").
+- La GUI al salir mata de verdad el runner de prueba (`terminate → espera → kill`) y para el icono de bandeja; ya no quedan procesos colgados al cerrar la app.
+
 ## 1.6.0
 - Nuevo modo de keep-alive `Visitar página de trabajo` (`work`): navegación completa a `keep_alive_url` (o a la página tras el login si no hay) en cada ciclo. Para sitios donde la sesión se sigue cerrando con `fetch` (XHR ignorado) o `reload` (recarga lo que haya): vuelve siempre a una URL conocida-buena, re-ejecuta su JS y renueva tokens; si caduca, re-login automático igual que el resto de modos.
 - Corrección: en modo visible el viewport de Playwright era fijo (1280x720) y la página no se redimensionaba al maximizar/achicar la ventana; ahora usa `viewport=None` para que siga a la ventana (en headless se mantiene fijo para capturas deterministas).
