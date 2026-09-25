@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.6.2
+- Pausar/reactivar, por fin visible: botón ⏸/▶ en la cabecera del formulario (sin tocar el resto ni pasar por Guardar), barra de lote disponible con 1 sola tarea seleccionada y nueva columna ESTADO en la lista (Activa/Pausada).
+- Pausar detiene el mantenimiento en curso: si la tarea tiene un runner vivo, pregunta y lo detiene (proceso + Chromium hijo) limpiando su lock; antes seguía corriendo hasta agotar su duración.
+- Instancia única de la GUI: si ya hay una app abierta, la segunda avisa con el PID y sale en vez de duplicar la ventana (el lock huérfano se reemplaza solo).
+
 ## 1.6.1
 - Corrección real del redimensionado en modo visible: la 1.6.0 usaba `viewport=None` (se ignora y queda el fijo 1280x720); ahora usa `no_viewport=True`, que es lo que Playwright documenta para que la página siga a la ventana al maximizar/achicar.
 - El runner detecta la pestaña cerrada también durante la espera entre ciclos y termina en ~60 s liberando el lock (antes retenía el lock hasta el siguiente ciclo y el siguiente intento decía "ya hay otra ejecución en curso").

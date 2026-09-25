@@ -15,6 +15,7 @@ import webbrowser
 from tkinter import filedialog, messagebox, ttk
 
 import config_store
+import task_lock
 from version import __version__ as APP_VERSION, GITHUB_REPO
 
 # Lógica pura (validaciones, formatos) vive en app_logic para poder testearla
@@ -585,7 +586,7 @@ class App(tk.Tk):
         ToolTip(self.run_now_btn, "Ejecuta al instante la tarea seleccionada (igual que «Probar ahora», sin tocar el formulario).")
 
         self.tree = ttk.Treeview(
-            list_card, columns=("time", "days", "validity", "last", "next", "run"), show="tree headings", height=6,
+            list_card, columns=("time", "days", "state", "validity", "last", "next", "run"), show="tree headings", height=6,
             selectmode="extended", style="Card.Treeview"
         )
         self._sort_column = None
@@ -593,13 +594,15 @@ class App(tk.Tk):
         self.tree.heading("#0", text="NOMBRE", command=lambda: self._sort_tree("#0"))
         self.tree.heading("time", text="HORA", command=lambda: self._sort_tree("time"))
         self.tree.heading("days", text="DÍAS", command=lambda: self._sort_tree("days"))
+        self.tree.heading("state", text="ESTADO", command=lambda: self._sort_tree("state"))
         self.tree.heading("validity", text="VIGENCIA", command=lambda: self._sort_tree("validity"))
         self.tree.heading("last", text="ÚLTIMA", command=lambda: self._sort_tree("last"))
         self.tree.heading("next", text="PRÓXIMA", command=lambda: self._sort_tree("next"))
         self.tree.heading("run", text="▶")
-        self.tree.column("#0", width=170, minwidth=140, stretch=True)
+        self.tree.column("#0", width=160, minwidth=130, stretch=True)
         self.tree.column("time", width=58, minwidth=52, anchor="center", stretch=False)
         self.tree.column("days", width=92, minwidth=80, anchor="center", stretch=False)
+        self.tree.column("state", width=78, minwidth=70, anchor="center", stretch=False)
         self.tree.column("validity", width=105, minwidth=95, anchor="center", stretch=False)
         self.tree.column("last", width=105, minwidth=95, anchor="center", stretch=False)
         self.tree.column("next", width=110, minwidth=100, anchor="center", stretch=False)
@@ -620,7 +623,7 @@ class App(tk.Tk):
             self.tree,
             "Clic en una tarea para cargarla en el formulario.\n"
             "Clic en ▶ para ejecutarla al instante.\n"
-            "Ctrl+clic o Mayús+clic para elegir varias y usar la barra de lote.",
+            "Clic para elegir una (o Ctrl+clic / Mayús+clic para varias) y usar la barra de lote.",
         )
         # Atajos de la lista: Supr elimina, Ctrl+A selecciona todo, Esc limpia.
         # Se ligan al Treeview (no globales) para no robar Ctrl+A a los campos.
@@ -640,7 +643,7 @@ class App(tk.Tk):
             style="Muted.TLabel", justify="center",
         )
 
-        # --- Acciones en lote (solo visible con 2+ tareas seleccionadas) ---
+        # --- Acciones en lote (visible con 1+ tareas seleccionadas) ---
         self.batch_bar = ttk.Frame(list_card, style="Card.TFrame")
         self.batch_bar.grid(row=5, column=0, sticky="ew", pady=(10, 0))
         self.batch_bar.grid_columnconfigure(0, weight=1)
@@ -659,7 +662,7 @@ class App(tk.Tk):
             command=self.on_batch_pause,
         )
         self.batch_pause_btn.pack(side="left", padx=(0, 6))
-        ToolTip(self.batch_pause_btn, "Pausar las tareas seleccionadas (quitan su tarea de Windows).")
+        ToolTip(self.batch_pause_btn, "Pausar las tareas seleccionadas (quitan su tarea de Windows).\nSi alguna tiene un mantenimiento en curso, pregunta si detenerlo.")
         self.batch_delete_btn = ttk.Button(
             batch_btns, text="🗑  Eliminar", style="IconDanger.TButton",
             command=self.on_batch_delete,
@@ -669,7 +672,7 @@ class App(tk.Tk):
         self.batch_bar.grid_remove()
         ttk.Label(
             list_card,
-            text="Consejo: clic en ▶ para ejecutar al instante · Ctrl+clic o Mayús+clic para elegir varias · Ctrl+A todas · Supr eliminar · Esc limpiar",
+            text="Consejo: clic en ▶ para ejecutar al instante · clic para elegir y usar la barra de lote · Ctrl+clic o Mayús+clic varias · Ctrl+A todas · Supr eliminar · Esc limpiar",
             style="Muted.TLabel",
         ).grid(row=6, column=0, sticky="w", pady=(6, 0))
 
@@ -687,25 +690,30 @@ class App(tk.Tk):
         self.mode_label.grid(row=0, column=0, sticky="w")
         self.mode_badge = ttk.Label(mode_row, text="SIN GUARDAR", style="ModeBadge.TLabel")
         self.mode_badge.grid(row=0, column=1, sticky="e", padx=(0, 8))
+        self.toggle_active_btn = ttk.Button(
+            mode_row, text="⏸  Pausar", style="IconGhost.TButton", command=self.on_toggle_active
+        )
+        self.toggle_active_btn.grid(row=0, column=2, sticky="e", padx=(0, 6))
+        ToolTip(self.toggle_active_btn, "Pausar / reactivar esta tarea sin tocar el resto del formulario.\nPausar quita su tarea programada de Windows y, si tiene un mantenimiento en curso, lo detiene.")
         self.log_btn = ttk.Button(
             mode_row, text="≣  Log", style="IconGhost.TButton", command=self.on_view_log
         )
-        self.log_btn.grid(row=0, column=2, sticky="e", padx=(0, 6))
+        self.log_btn.grid(row=0, column=3, sticky="e", padx=(0, 6))
         ToolTip(self.log_btn, "Abre el registro completo de esta tarea (qué pasó en cada ejecución).")
         self.screenshot_btn = ttk.Button(
             mode_row, text="◉  Captura", style="IconGhost.TButton", command=self.on_view_screenshot
         )
-        self.screenshot_btn.grid(row=0, column=3, sticky="e", padx=(0, 6))
+        self.screenshot_btn.grid(row=0, column=4, sticky="e", padx=(0, 6))
         ToolTip(self.screenshot_btn, "Abre la última captura guardada: muestra qué se veía en la página cuando falló un login.")
         self.duplicate_btn = ttk.Button(
             mode_row, text="⧉  Duplicar", style="IconGhost.TButton", command=self.on_duplicate_task
         )
-        self.duplicate_btn.grid(row=0, column=4, sticky="e", padx=(0, 6))
+        self.duplicate_btn.grid(row=0, column=5, sticky="e", padx=(0, 6))
         ToolTip(self.duplicate_btn, "Crea una copia de esta tarea como borrador nuevo (tendrás que pulsar Guardar).")
         self.delete_btn = ttk.Button(
             mode_row, text="🗑  Eliminar", style="IconDanger.TButton", command=self.on_delete_task
         )
-        self.delete_btn.grid(row=0, column=5, sticky="e")
+        self.delete_btn.grid(row=0, column=6, sticky="e")
         ToolTip(self.delete_btn, "Borra esta tarea y su tarea programada de Windows (pide confirmación).")
         frow += 1
 
@@ -1180,6 +1188,10 @@ class App(tk.Tk):
                 except Exception:
                     pass
                 self.tray_icon = None
+        except Exception:
+            pass
+        try:
+            task_lock.release("app-gui")
         except Exception:
             pass
         try:
@@ -1816,6 +1828,7 @@ class App(tk.Tk):
                 values=(
                     task.get("schedule_time", ""),
                     _days_display(task.get("schedule_days", [])),
+                    "Pausada" if not active else "Activa",
                     _validity_display(
                         task.get("schedule_start_date", ""),
                         task.get("schedule_end_date", ""),
@@ -1914,12 +1927,15 @@ class App(tk.Tk):
             return []
 
     def _update_batch_bar(self):
-        """Muestra la barra de lote solo cuando hay 2+ tareas seleccionadas."""
+        """Muestra la barra de lote cuando hay 1+ tareas seleccionadas."""
         if not hasattr(self, "batch_bar"):
             return
         ids = self._selected_ids()
-        if len(ids) >= 2:
-            self.batch_label.configure(text=f"{len(ids)} seleccionadas — el formulario no se toca")
+        if len(ids) >= 1:
+            if len(ids) == 1:
+                self.batch_label.configure(text="1 seleccionada — activar, pausar o eliminar sin tocar el formulario")
+            else:
+                self.batch_label.configure(text=f"{len(ids)} seleccionadas — el formulario no se toca")
             self.batch_bar.grid()
         else:
             self.batch_bar.grid_remove()
@@ -2188,20 +2204,85 @@ class App(tk.Tk):
 
     def _batch_set_active(self, active: bool):
         ids = [i for i in self._selected_ids() if self.tree.exists(i)]
-        if len(ids) < 2:
+        if len(ids) < 1:
             return
-        for task_id in ids:
-            self._set_task_active(task_id, active)
-        self._refresh_task_list(select_ids=ids)
-        self._set_status(
-            "info",
-            f"{'Activando' if active else 'Pausando'} {len(ids)} tareas en Windows…",
+        if not active:
+            live = [(i, self._live_runner_pid(i)) for i in ids]
+            live = [(i, pid) for i, pid in live if pid is not None]
+            if live and not messagebox.askyesno(
+                "Pausar tareas",
+                f"{len(live)} de estas tareas tienen un mantenimiento de sesión en curso.\n"
+                "¿Detenerlos también al pausar?",
+            ):
+                return
+            self._apply_active_async(ids, False, kill_runners=True)
+        else:
+            self._apply_active_async(ids, True, kill_runners=False)
+
+    def _live_runner_pid(self, task_id: str) -> int | None:
+        """PID del runner vivo de `task_id` (keep-alive o prueba en curso), o
+        None si no hay nadie. Nunca devuelve nuestro propio PID."""
+        try:
+            pid = task_lock.live_lock_pid(task_id)
+        except Exception:
+            return None
+        if pid is None:
+            return None
+        try:
+            if int(pid) == os.getpid():
+                return None
+        except (TypeError, ValueError):
+            return None
+        return pid
+
+    def _apply_active_async(self, task_ids: list, active: bool, kill_runners: bool):
+        """Cambia el flag activo, refresca y sincroniza con Windows en fondo.
+
+        Si `kill_runners` (solo al pausar y ya confirmado), detiene primero
+        los runners vivos de esas tareas (proceso + Chromium hijo) y limpia
+        sus locks huérfanos."""
+        for task_id in task_ids:
+            try:
+                self._set_task_active(task_id, active)
+            except Exception:
+                pass
+        try:
+            self.active_var.set(active)
+        except Exception:
+            pass
+        self._refresh_task_list(
+            select_ids=[t for t in task_ids if self.tree.exists(t)]
         )
+        self._refresh_toggle_btn()
+        action = "Activando y programando" if active else "Pausando"
+        if len(task_ids) == 1:
+            self._set_status("info", f"{action} la tarea en Windows…")
+        else:
+            self._set_status("info", f"{action} {len(task_ids)} tareas en Windows…")
         threading.Thread(
-            target=self._batch_sync_thread, args=(ids, active), daemon=True,
+            target=self._apply_active_thread,
+            args=(list(task_ids), active, kill_runners), daemon=True,
         ).start()
 
-    def _batch_sync_thread(self, task_ids: list, active: bool):
+    def _apply_active_thread(self, task_ids: list, active: bool, kill_runners: bool):
+        stopped = 0
+        if kill_runners and not active:
+            for task_id in task_ids:
+                try:
+                    pid = self._live_runner_pid(task_id)
+                except Exception:
+                    pid = None
+                if pid is None:
+                    continue
+                try:
+                    if task_lock.stop_process_tree(pid):
+                        stopped += 1
+                except Exception:
+                    pass
+                try:
+                    task_lock.clear_dead_lock(task_id)
+                except Exception:
+                    pass
         ok_count = 0
         for task_id in task_ids:
             try:
@@ -2215,21 +2296,78 @@ class App(tk.Tk):
                 f"Se {'activaron' if active else 'pausaron'} {ok_count}/{len(task_ids)} en la lista; "
                 f"{failed} no se pudieron {'programar' if active else 'quitar'} en Windows."
             )
-            self.after(0, lambda: self._batch_done(False, task_ids, message))
+            self.after(0, lambda: self._apply_active_done(False, task_ids, message))
         else:
-            action = "activadas y programadas" if active else "pausadas"
-            message = f"✓ {len(task_ids)} tareas {action} correctamente."
-            self.after(0, lambda: self._batch_done(True, task_ids, message))
+            if active:
+                message = (
+                    "✓ Tarea activada y programada correctamente."
+                    if len(task_ids) == 1 else
+                    f"✓ {len(task_ids)} tareas activadas y programadas correctamente."
+                )
+            else:
+                extra = f" ({stopped} mantenimiento(s) detenido(s))" if stopped else ""
+                message = (
+                    f"✓ Tarea pausada correctamente.{extra}"
+                    if len(task_ids) == 1 else
+                    f"✓ {len(task_ids)} tareas pausadas correctamente.{extra}"
+                )
+            self.after(0, lambda: self._apply_active_done(True, task_ids, message))
 
-    def _batch_done(self, ok: bool, task_ids: list, message: str):
+    def _apply_active_done(self, ok: bool, task_ids: list, message: str):
         self._refresh_task_list(select_ids=[t for t in task_ids if self.tree.exists(t)])
+        self._refresh_toggle_btn()
         self._set_status("success" if ok else "danger", message)
         if not ok:
-            messagebox.showwarning("Acción en lote", message)
+            messagebox.showwarning("Activar / pausar", message)
+
+    def on_toggle_active(self):
+        """Botón ⏸/▶ de la cabecera: pausa o reactiva la tarea abierta sin
+        tocar el resto del formulario."""
+        task_id = self.current_task_id
+        if not task_id or not self.tree.exists(task_id):
+            messagebox.showinfo(
+                "Nada que pausar", "Selecciona una tarea de la lista para pausarla o reactivarla."
+            )
+            return
+        data = config_store.get_task(task_id)
+        if not data:
+            messagebox.showerror("No se puede cambiar", "Esa tarea ya no existe. Recarga la lista.")
+            return
+        if data.get("active", True):
+            pid = self._live_runner_pid(task_id)
+            if pid is not None and not messagebox.askyesno(
+                "Pausar tarea",
+                "Hay un mantenimiento de sesión en curso "
+                f"(PID {pid}).\n¿Detenerlo también y pausar la tarea?",
+            ):
+                return
+            self._apply_active_async([task_id], False, kill_runners=True)
+        else:
+            self._apply_active_async([task_id], True, kill_runners=False)
+
+    def _refresh_toggle_btn(self):
+        """Texto y visibilidad del botón ⏸/▶ según la tarea abierta."""
+        if not hasattr(self, "toggle_active_btn"):
+            return
+        task_id = getattr(self, "current_task_id", None)
+        if not task_id or not self.tree.exists(task_id):
+            self.toggle_active_btn.grid_remove()
+            return
+        try:
+            data = config_store.get_task(task_id)
+        except Exception:
+            data = None
+        if not data:
+            self.toggle_active_btn.grid_remove()
+            return
+        self.toggle_active_btn.configure(
+            text="▶  Activar" if not data.get("active", True) else "⏸  Pausar"
+        )
+        self.toggle_active_btn.grid()
 
     def on_batch_delete(self):
         ids = [i for i in self._selected_ids() if self.tree.exists(i)]
-        if len(ids) < 2:
+        if len(ids) < 1:
             return
         names = []
         for task_id in ids:
@@ -2390,6 +2528,7 @@ class App(tk.Tk):
         self.duplicate_btn.grid_remove()
         self.screenshot_btn.grid_remove()
         self.log_btn.grid_remove()
+        self._refresh_toggle_btn()
         self._set_status("info", "Revisa los datos y pulsa Guardar para crear la copia como tarea independiente.")
 
     def _clear_form(self):
@@ -2428,6 +2567,7 @@ class App(tk.Tk):
         self.duplicate_btn.grid_remove()
         self.screenshot_btn.grid_remove()
         self.log_btn.grid_remove()
+        self._refresh_toggle_btn()
 
     def _populate_form(self, data: dict):
         self.name_var.set(data.get("name", ""))
@@ -2487,6 +2627,7 @@ class App(tk.Tk):
         self.mode_badge.configure(text="ACTIVA" if data.get("active", True) else "PAUSADA")
         self.delete_btn.grid()
         self.duplicate_btn.grid()
+        self._refresh_toggle_btn()
         self._refresh_screenshot_button()
         self._refresh_log_button()
 
@@ -2893,9 +3034,43 @@ class App(tk.Tk):
 
 
 if __name__ == "__main__":
-    app = App()
-    if "--start-minimized" in sys.argv[1:]:
-        app.withdraw()
-        if pystray is not None:
-            app._start_tray_icon()
-    app.mainloop()
+    # Instancia única: si ya hay una GUI viva (mismo usuario/equipo), la
+    # segunda avisa y sale en vez de abrir una ventana duplicada que
+    # confunde (cada una con su runner de prueba y su estado).
+    # Reusa el lock anti-solape: si el PID dueño murió, se considera
+    # obsoleto y se reemplaza solo.
+    try:
+        import task_lock
+        _acquired, _info = task_lock.acquire("app-gui")
+    except Exception:
+        _acquired, _info = True, None
+    if not _acquired:
+        _other_pid = (_info or {}).get("pid", "?") if isinstance(_info, dict) else "?"
+        try:
+            _root = tk.Tk()
+            _root.withdraw()
+            messagebox.showinfo(
+                "aLoguear ya está abierto",
+                f"Ya hay otra instancia de aLoguear en ejecución (PID {_other_pid}).\n"
+                "Búscala en la ventana o en la bandeja del sistema (junto al reloj).\n"
+                "Si no la ves, mata ese proceso y vuelve a abrirla.",
+            )
+            try:
+                _root.destroy()
+            except Exception:
+                pass
+        except Exception:
+            pass
+        sys.exit(0)
+    try:
+        app = App()
+        if "--start-minimized" in sys.argv[1:]:
+            app.withdraw()
+            if pystray is not None:
+                app._start_tray_icon()
+        app.mainloop()
+    finally:
+        try:
+            task_lock.release("app-gui")
+        except Exception:
+            pass

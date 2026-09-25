@@ -17,6 +17,8 @@ import contextlib
 import datetime
 import json
 import os
+import subprocess
+import time
 
 STALE_AFTER_SEC = 24 * 3600
 
@@ -168,6 +170,123 @@ def release(task_id: str, log_dir: str | None = None) -> None:
         os.remove(path)
     except OSError:
         pass
+
+
+def lock_info(task_id: str, log_dir: str | None = None) -> dict | None:
+    """Devuelve el contenido del lock de `task_id`, o None si no hay o es
+    ilegible. Solo lectura: nunca crea ni modifica nada."""
+    return _read_lock(lock_path(task_id, log_dir))
+
+
+def clear_dead_lock(task_id: str, log_dir: str | None = None,
+                    stale_after_sec: int = STALE_AFTER_SEC) -> bool:
+    """Borra el lock de `task_id` si está obsoleto (dueño muerto, corrupto o
+    antiquísimo) y devuelve True. Si hay una ejecución viva, no toca nada y
+    devuelve False. Nunca lanza excepciones."""
+    try:
+        path = lock_path(task_id, log_dir)
+        info = _read_lock(path)
+        if info is None and not os.path.exists(path):
+            return False
+        if not _lock_is_stale(info, stale_after_sec):
+            return False
+        try:
+            os.remove(path)
+        except OSError:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def live_lock_pid(task_id: str, log_dir: str | None = None) -> int | None:
+    """PID de la ejecución viva que tiene el lock de `task_id`, o None si no
+    hay nadie vivo (incluye nuestro propio PID si somos nosotros)."""
+    try:
+        info = _read_lock(lock_path(task_id, log_dir))
+        if not isinstance(info, dict):
+            return None
+        pid = int(info.get("pid", -1))
+    except (TypeError, ValueError):
+        return None
+    except Exception:
+        return None
+    try:
+        return pid if is_pid_running(pid) else None
+    except Exception:
+        return None
+
+
+def stop_process_tree(pid: int, timeout: float = 5.0) -> bool:
+    """Detiene el proceso `pid` con sus hijos (el runner y su Chromium) y
+    devuelve True si al final ya no está vivo. Nunca lanza excepciones.
+
+    En Windows usa `taskkill /T` (primero amable, luego `/F` si resiste);
+    en el resto, SIGTERM y luego SIGKILL al PID (sin árbol: mejor esfuerzo).
+    Nunca se llama sobre nuestro propio PID (el llamante debe excluirlo)."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        if not is_pid_running(pid):
+            return True
+    except Exception:
+        pass
+    try:
+        if os.name == "nt":
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/T"],
+                    capture_output=True, timeout=10,
+                )
+            except Exception:
+                pass
+            deadline = time.monotonic() + max(0.0, timeout)
+            while time.monotonic() < deadline:
+                try:
+                    if not is_pid_running(pid):
+                        return True
+                except Exception:
+                    return True
+                time.sleep(0.25)
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    capture_output=True, timeout=10,
+                )
+            except Exception:
+                pass
+            try:
+                return not is_pid_running(pid)
+            except Exception:
+                return False
+        else:
+            import signal
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except Exception:
+                pass
+            deadline = time.monotonic() + max(0.0, timeout)
+            while time.monotonic() < deadline:
+                try:
+                    if not is_pid_running(pid):
+                        return True
+                except Exception:
+                    return True
+                time.sleep(0.25)
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except Exception:
+                pass
+            try:
+                return not is_pid_running(pid)
+            except Exception:
+                return False
+    except Exception:
+        return False
 
 
 @contextlib.contextmanager

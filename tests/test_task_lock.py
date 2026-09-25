@@ -77,3 +77,62 @@ def test_is_pid_running_current_process():
     assert not task_lock.is_pid_running(999999999)
     assert not task_lock.is_pid_running(-5)
     assert not task_lock.is_pid_running("no-un-pid")
+
+
+def test_lock_info_read_only(tmp_path):
+    log_dir = str(tmp_path)
+    assert task_lock.lock_info("abc123", log_dir=log_dir) is None
+    ok, _ = task_lock.acquire("abc123", log_dir=log_dir)
+    assert ok
+    try:
+        info = task_lock.lock_info("abc123", log_dir=log_dir)
+        assert isinstance(info, dict) and info["pid"] == os.getpid()
+        # Solo lectura: el lock sigue ahí y sigue siendo nuestro.
+        assert os.path.exists(os.path.join(log_dir, "abc123.lock"))
+    finally:
+        task_lock.release("abc123", log_dir=log_dir)
+
+
+def test_clear_dead_lock(tmp_path):
+    log_dir = str(tmp_path)
+    assert task_lock.clear_dead_lock("nada", log_dir=log_dir) is False
+    stale = {"pid": 999999999, "started_at": datetime.datetime.now().isoformat()}
+    path = os.path.join(log_dir, "abc123.lock")
+    os.makedirs(log_dir, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(stale, f)
+    assert task_lock.clear_dead_lock("abc123", log_dir=log_dir) is True
+    assert not os.path.exists(path)
+
+
+def test_clear_dead_lock_keeps_live(tmp_path):
+    log_dir = str(tmp_path)
+    ok, _ = task_lock.acquire("abc123", log_dir=log_dir)
+    assert ok
+    try:
+        assert task_lock.clear_dead_lock("abc123", log_dir=log_dir) is False
+        assert os.path.exists(os.path.join(log_dir, "abc123.lock"))
+    finally:
+        task_lock.release("abc123", log_dir=log_dir)
+
+
+def test_live_lock_pid(tmp_path):
+    log_dir = str(tmp_path)
+    assert task_lock.live_lock_pid("abc123", log_dir=log_dir) is None
+    ok, _ = task_lock.acquire("abc123", log_dir=log_dir)
+    assert ok
+    try:
+        assert task_lock.live_lock_pid("abc123", log_dir=log_dir) == os.getpid()
+    finally:
+        task_lock.release("abc123", log_dir=log_dir)
+    stale = {"pid": 999999999, "started_at": datetime.datetime.now().isoformat()}
+    path = os.path.join(log_dir, "abc123.lock")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(stale, f)
+    assert task_lock.live_lock_pid("abc123", log_dir=log_dir) is None
+
+
+def test_stop_process_tree_invalid_and_dead():
+    assert task_lock.stop_process_tree(-5) is False
+    assert task_lock.stop_process_tree("basura") is False
+    assert task_lock.stop_process_tree(999999999) is True  # ya muerto: éxito
