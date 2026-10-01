@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.7.0
+- Nuevo modo de keep-alive `Petición directa al servidor` (`request`, ahora recomendado): latido con `page.context.request` usando las cookies de la sesión, sin tocar la pestaña visible ni ejecutar JS (solo descarga el HTML). Tráfico real que renueva la inactividad en el servidor con transferencia mínima y sin registrar conexiones nuevas; con intervalo corto (2-5 min) aguanta plataformas que echan por inactividad en 10-30 min, donde el modo ligero (cero peticiones) no puede funcionar. Misma doble confirmación anti falso positivo y re-login que el resto de modos; 6 tests nuevos.
+- Nueva opción por tarea `Si el equipo estaba apagado, ejecutar en cuanto sea posible` (equivale al `StartWhenAvailable` del Programador de tareas).
+- La lista distingue tareas en marcha: fila en verde con 🟢, ESTADO `🟢 En marcha`, columna ▶ a ⏹ y contador, con sondeo cada 5 s; pulsar ⏹ avisa en vez de relanzar.
+- Corrección en `find_first`: si la página se cerró (p. ej. ventana cerrada a mano), se propaga como error de navegación con reintentos en vez de informar "campo no encontrado" y "selector no válido" por cada candidato.
+- Corrección en la rama de login fallido: la captura y la URL/título van protegidas si la página ya estaba cerrada (antes dejaban un traceback ruidoso).
+- Corrección: el filtro de búsqueda ya no revienta al arrancar (`tree` aún no existe) y el runner de `Probar ahora` ya no ensucia la consola de la app.
+
 ## 1.6.2
 - Pausar/reactivar, por fin visible: botón ⏸/▶ en la cabecera del formulario (sin tocar el resto ni pasar por Guardar), barra de lote disponible con 1 sola tarea seleccionada y nueva columna ESTADO en la lista (Activa/Pausada).
 - Pausar detiene el mantenimiento en curso: si la tarea tiene un runner vivo, pregunta y lo detiene (proceso + Chromium hijo) limpiando su lock; antes seguía corriendo hasta agotar su duración.

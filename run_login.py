@@ -22,6 +22,7 @@ instante desde la GUI).
 import datetime
 import os
 import random
+import re
 import subprocess
 import sys
 import time
@@ -141,6 +142,12 @@ def find_first(page, explicit_selector: str, candidates: list[str], timeout_ms: 
         except PlaywrightTimeoutError:
             continue
         except PlaywrightError as exc:
+            # Si se cerró la página/contexto/navegador (p. ej. el usuario
+            # cerró la ventana a mano), no es un selector malo: se propaga
+            # para que el llamante lo trate como error de navegación (con
+            # reintentos) en vez de informar "campo no encontrado".
+            if "has been closed" in str(exc):
+                raise
             # Selector CSS inválido u otro error de sintaxis: no reintentar
             # el resto como si fuera "no encontrado", avisar en el log.
             log(f"Selector no válido '{selector}': {exc}")
@@ -650,6 +657,11 @@ def normalize_keep_alive_mode(value) -> str:
       Moodle) sin registrar conexiones nuevas.
     - 'light': solo actividad local (ratón/scroll), cero peticiones. Solo
       sirve en sitios con temporizador de inactividad en JavaScript.
+    - 'request': petición directa al servidor con `page.context.request`
+      (las cookies de la sesión, sin tocar la pestaña visible ni ejecutar
+      JS: solo descarga el HTML). Es tráfico real para el servidor
+      (renueva la inactividad igual que una visita) pero mínimo en
+      transferencia y sin re-renderizar nada.
     - 'reload': recarga completa la página en cada ciclo (comportamiento
       anterior; algunos sitios lo exigen, pero la plataforma puede contarlo
       como una conexión nueva cada vez).
@@ -664,6 +676,8 @@ def normalize_keep_alive_mode(value) -> str:
         return "reload"
     if v == "light":
         return "light"
+    if v == "request" or "directa" in v or "request" in v:
+        return "request"
     if v in ("work", "visit", "visita") or "visitar" in v or "work" in v:
         return "work"
     return "fetch"
@@ -715,6 +729,69 @@ def _fetch_heartbeat(page) -> tuple[bool, str]:
         if "login-page" in result:
             return False, result
         return True, result
+    except PlaywrightError:
+        return False, "pestaña cerrada"
+
+
+_LOGIN_HINT_RE = re.compile(r"<input[^>]*type=[\"']?password[\"']?", re.IGNORECASE)
+_LOGIN_WORD_RE = re.compile(r"login|log-in|signin|sign-in|acceder|iniciar sesi", re.IGNORECASE)
+
+
+def _looks_like_login_page(text: str) -> bool:
+    """Heurística compartida fetch/request: el HTML parece una página de
+    login (campo de contraseña + palabra de acceso)."""
+    try:
+        return bool(_LOGIN_HINT_RE.search(text or "")) and bool(_LOGIN_WORD_RE.search(text or ""))
+    except Exception:
+        return False
+
+
+def _request_heartbeat(page, target_url: str | None = None) -> tuple[bool, str]:
+    """Petición directa al servidor con las cookies de la sesión, sin tocar
+    la pestaña visible ni ejecutar JS: solo descarga el HTML (mínimo en
+    transferencia) y renueva la inactividad igual que una visita.
+
+    Usa `page.context.request` (compar­te el almacenamiento del contexto,
+    incluidas las cookies de la sesión). Devuelve (sigue_viva, detalle):
+    sigue_viva es False si la pestaña está cerrada o si la respuesta
+    parece una página de login (sesión caducada). Tolera dobles de test
+    sin context/request (cae al fetch en página) y errores de red
+    (no tumban el ciclo: se vigila por DOM).
+    """
+    try:
+        try:
+            closed = page.is_closed()
+        except Exception:
+            closed = False
+        if closed:
+            return False, "pestaña cerrada"
+        context = getattr(page, "context", None)
+        request = getattr(context, "request", None)
+        get = getattr(request, "get", None)
+        if not callable(get):
+            return _fetch_heartbeat(page)
+        if not (target_url or "").strip():
+            try:
+                target_url = (page.url or "").split("#")[0]
+            except Exception:
+                target_url = ""
+        if not (target_url or "").strip():
+            return True, "sin URL; se vigila por DOM"
+        try:
+            resp = get(target_url, timeout=25000,
+                       headers={"Cache-Control": "no-store"})
+        except PlaywrightError as exc:
+            return True, f"petición falló ({exc}); se vigila por DOM"
+        except Exception as exc:
+            return True, f"petición falló ({exc}); se vigila por DOM"
+        try:
+            status = resp.status
+            text = resp.text()
+        except Exception as exc:
+            return True, f"respuesta ilegible ({exc}); se vigila por DOM"
+        if _looks_like_login_page(text):
+            return False, f"http {status} login-page"
+        return True, f"http {status} ok"
     except PlaywrightError:
         return False, "pestaña cerrada"
 
@@ -839,6 +916,10 @@ def keep_session_alive(page, cfg: dict, pass_sel: str | None = None,
     - 'light': solo actividad local (ratón/scroll), cero peticiones. Solo
       evita cierres por temporizador JavaScript; NO mantiene sesiones que
       caducan en el servidor por inactividad.
+    - 'request' (recomendado si fetch no basta): petición directa al
+      servidor con las cookies de la sesión, sin tocar la pestaña visible
+      ni ejecutar JS (solo descarga el HTML). Tráfico real que renueva la
+      inactividad con transferencia mínima.
     - 'reload': recarga completa la página actual en cada ciclo.
     - 'work': visita la página de trabajo (`keep_alive_url` o la URL tras
       el login) con navegación completa en cada ciclo. El más fuerte si la
@@ -899,6 +980,9 @@ def keep_session_alive(page, cfg: dict, pass_sel: str | None = None,
         mode_txt = "recarga"
     elif mode == "light":
         mode_txt = "actividad ligera local (sin peticiones)"
+    elif mode == "request":
+        req_txt = (cfg.get("keep_alive_url") or "").strip() or "página tras el login"
+        mode_txt = f"petición directa al servidor ({req_txt}, sin tocar la pestaña)"
     elif mode == "work":
         work_txt = (cfg.get("keep_alive_url") or "").strip() or "página tras el login"
         mode_txt = f"visita a la página de trabajo ({work_txt})"
@@ -1000,6 +1084,79 @@ def keep_session_alive(page, cfg: dict, pass_sel: str | None = None,
                 stats["end_reason"] = "tab-closed"
                 return stats
             alive, detail = _fetch_heartbeat(page)
+            if alive:
+                consecutive = 0
+                stats["refreshes"] += 1
+                log(f"Falsa alarma: el servidor responde ({detail}); no se reconecta.")
+                continue
+            log("La caducidad persiste; haciendo una única recarga de confirmación...")
+            refreshed = False
+            for attempt in range(1, max_retries + 1):
+                try:
+                    page.reload(wait_until="domcontentloaded", timeout=30000)
+                    refreshed = True
+                    break
+                except PlaywrightError as exc:
+                    try:
+                        closed = page.is_closed()
+                    except Exception:
+                        closed = False
+                    if closed:
+                        log("Se detiene el mantenimiento de sesión: la pestaña se cerró.")
+                        stats["end_reason"] = "tab-closed"
+                        return stats
+                    log(f"Intento {attempt}/{max_retries} de recarga de confirmación falló ({exc}); reintentando...")
+                    _backoff_sleep(attempt, sleeper)
+            if not refreshed:
+                if _failed_cycle("No se pudo confirmar la sesión tras varios intentos",
+                                 "No se pudo confirmar la sesión tras varios intentos; se detuvo el mantenimiento."):
+                    return stats
+                continue
+            if not is_session_expired(page, pass_sel, home_url):
+                consecutive = 0
+                stats["refreshes"] += 1
+                log("La sesión sigue activa tras la recarga de confirmación; no hizo falta re-login.")
+                continue
+            # Caducidad confirmada: cae al re-login común de abajo.
+            elapsed_min = _elapsed()
+        elif mode == "request":
+            # Petición directa al servidor con las cookies de la sesión, sin
+            # tocar la pestaña visible ni ejecutar JS: tráfico real que
+            # renueva la inactividad con transferencia mínima (no registra
+            # conexiones nuevas en la plataforma).
+            try:
+                closed = page.is_closed()
+            except Exception:
+                closed = False
+            if closed:
+                log("Se detiene el mantenimiento de sesión: la pestaña se cerró.")
+                stats["end_reason"] = "tab-closed"
+                return stats
+            target = _resolve_work_target(cfg, home_url, page)
+            _light_heartbeat(page)  # actividad local extra, inofensiva
+            alive, detail = _request_heartbeat(page, target)
+            if alive:
+                consecutive = 0
+                stats["refreshes"] += 1
+                elapsed_min = _elapsed()
+                remaining_txt = ""
+                if deadline is not None:
+                    remaining_txt = f", quedan ~{max(0.0, (deadline - clock()) / 60):.0f} min"
+                log(f"Sesión activa (petición directa al servidor, {detail}, sin tocar la pestaña) ({elapsed_min:.0f} min transcurridos{remaining_txt}).")
+                continue
+            # Posible caducidad (la respuesta parece un login): confirmar
+            # con otra petición antes de reconectar (anti falso positivo).
+            log(f"Posible caducidad detectada ({detail}); confirmando en 15 s sin reconectar (anti falso positivo)...")
+            sleeper(15)
+            try:
+                closed = page.is_closed()
+            except Exception:
+                closed = False
+            if closed:
+                log("Se detiene el mantenimiento de sesión: la pestaña se cerró.")
+                stats["end_reason"] = "tab-closed"
+                return stats
+            alive, detail = _request_heartbeat(page, target)
             if alive:
                 consecutive = 0
                 stats["refreshes"] += 1
@@ -1330,12 +1487,19 @@ def main() -> int:
 
                 if status == "failed":
                     hints = collect_error_hints(page)
-                    page.screenshot(path=screenshot_path)
+                    try:
+                        if not page.is_closed():
+                            page.screenshot(path=screenshot_path)
+                            log(f"Captura guardada en {screenshot_path} (ábrela para ver qué muestra la página).")
+                    except Exception:
+                        log("No se pudo guardar la captura (la página ya estaba cerrada).")
                     log("AVISO: tras enviar el formulario sigue visible el campo de contraseña.")
-                    log(f"URL actual: {page.url} | Título: {page.title()}")
+                    try:
+                        log(f"URL actual: {page.url} | Título: {page.title()}")
+                    except Exception:
+                        pass
                     if hints:
                         log(f"Posible mensaje de error en la página: {hints}")
-                    log(f"Captura guardada en {screenshot_path} (ábrela para ver qué muestra la página).")
                     message = "Login fallido: credenciales rechazadas o formulario seguía visible."
                     config_store.save_last_result(task_id, False, message)
                     if not no_keep_alive:

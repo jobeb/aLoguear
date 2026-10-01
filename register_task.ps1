@@ -29,6 +29,14 @@
     Fecha de fin de vigencia (YYYY-MM-DD, inclusiva). Vacío = sin límite. Se
     aplica como EndBoundary del desencadenador y además la comprueba el runner.
 
+.PARAMETER StartWhenAvailable
+    "True" (por defecto) o "False". Si es True, Windows ejecuta la tarea
+    cuanto antes si se perdió la hora programada porque el equipo estaba
+    apagado o suspendido. Equivale a "Ejecutar la tarea lo antes posible
+    después de omitirse la programación" en el Programador de tareas.
+    (Es texto y no booleano porque los argumentos que llegan por línea de
+    comandos no se convierten solos a [bool] en PowerShell 5.1.)
+
 .NOTES
     La contraseña se descifra con DPAPI ligado a tu usuario de Windows, por lo
     que la tarea se registra con inicio de sesión "Interactive": solo se
@@ -43,7 +51,8 @@ param(
     [string]$TaskName = "",
     [string]$RunnerExe = "",
     [string]$StartDate = "",
-    [string]$EndDate = ""
+    [string]$EndDate = "",
+    [string]$StartWhenAvailable = "True"
 )
 
 $ErrorActionPreference = "Stop"
@@ -112,7 +121,8 @@ if ($EndDate -and $EndDate.Trim() -ne "") {
 }
 
 $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
-$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+$swa = "$StartWhenAvailable".Trim().ToLowerInvariant() -notin @("false", "0", "no", "off")
+$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable:$swa -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
     -ExecutionTimeLimit ([TimeSpan]::Zero)
 
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
@@ -122,4 +132,4 @@ $rangeMsg = ""
 if (($StartDate -and $StartDate.Trim() -ne "") -or ($EndDate -and $EndDate.Trim() -ne "")) {
     $rangeMsg = " (vigencia: $($StartDate.Trim()) -> $($EndDate.Trim()))"
 }
-Write-Host "Tarea '$TaskName' registrada: se ejecutará a las $Time los días: $($dayList -join ', ')$rangeMsg (requiere sesión iniciada)."
+Write-Host "Tarea '$TaskName' registrada: se ejecutará a las $Time los días: $($dayList -join ', ')$rangeMsg (requiere sesión iniciada; recuperar si se apaga: $swa)."

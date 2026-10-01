@@ -34,9 +34,10 @@ Lista priorizada de mejoras posibles. `P1` = alto valor / bajo coste,
 
 ## Keep-alive
 
-- **P2 – Heartbeat configurable**: elegir entre recarga completa, `fetch` ligero
-  o navegación a una URL "ping" del sitio (algunos campus penalizan recargas
-  totales frecuentes).
+- **P2 – Heartbeat configurable**: HECHO (modo `request`: petición directa con
+  las cookies vía `page.context.request`, además de `fetch`, `work`, `light`
+  y `reload`). Queda pendiente la URL "ping" configurable por tarea (hoy el
+  modo `request` usa la página de trabajo o la URL tras el login).
 - **P2 – Horario de keep-alive**: limitar el mantenimiento a una franja horaria
   (p. ej. solo 8:00–20:00) en vez de duración desde el login.
 - **P3 – Keep-alive cooperativo**: un solo proceso que mantiene varias tareas a

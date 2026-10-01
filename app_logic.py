@@ -83,7 +83,7 @@ DAY_LABELS = {name: label for label, name in DAYS}
 _EXPORT_FIELDS = [
     "name", "url", "username", "headless", "user_selector", "pass_selector",
     "submit_selector", "schedule_time", "schedule_days",
-    "schedule_start_date", "schedule_end_date", "keep_alive",
+    "schedule_start_date", "schedule_end_date", "run_missed_asap", "keep_alive",
     "keep_alive_interval_min", "keep_alive_duration_min", "keep_alive_mode",
     "keep_alive_url",
     "keep_alive_time_from", "keep_alive_time_to", "active",
@@ -92,14 +92,17 @@ _EXPORT_FIELDS = [
 
 def normalize_keep_alive_mode(value) -> str:
     """Normaliza el modo de keep-alive: 'fetch' (petición ligera, por
-    defecto), 'light' (solo actividad local), 'reload' (recarga completa)
-    o 'work' (visita la página de trabajo).
+    defecto), 'light' (solo actividad local), 'request' (petición directa
+    al servidor), 'reload' (recarga completa) o 'work' (visita la página
+    de trabajo).
     Cualquier valor ausente/inválido cae a 'fetch'."""
     v = str(value or "").strip().lower()
     if v == "reload":
         return "reload"
     if v == "light":
         return "light"
+    if v == "request" or "directa" in v or "request" in v:
+        return "request"
     if v in ("work", "visit", "visita") or "visitar" in v or "work" in v:
         return "work"
     return "fetch"

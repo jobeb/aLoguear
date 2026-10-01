@@ -282,6 +282,10 @@ def get_task(task_id: str) -> dict | None:
         # Tareas antiguas sin este campo usan 'fetch' (mantiene la sesión
         # sin registrar conexiones nuevas).
         data["keep_alive_mode"] = _normalize_keep_alive_mode(data.get("keep_alive_mode", "fetch"))
+        # Tareas antiguas sin este campo: se ejecutaban cuanto antes si se
+        # perdía la hora (StartWhenAvailable siempre activo). Por defecto True.
+        if "run_missed_asap" not in data:
+            data["run_missed_asap"] = True
         password_enc = data.get("password_enc", "")
         if not password_enc:
             data["password"] = ""
@@ -296,13 +300,15 @@ def get_task(task_id: str) -> dict | None:
 
 def _normalize_keep_alive_mode(value) -> str:
     """'fetch' (petición ligera, por defecto), 'light' (solo actividad
-    local), 'reload' (recarga completa) o 'work' (visita la página de
-    trabajo)."""
+    local), 'request' (petición directa al servidor), 'reload' (recarga
+    completa) o 'work' (visita la página de trabajo)."""
     v = str(value or "").strip().lower()
     if v == "reload":
         return "reload"
     if v == "light":
         return "light"
+    if v == "request" or "directa" in v or "request" in v:
+        return "request"
     if v in ("work", "visit", "visita") or "visitar" in v or "work" in v:
         return "work"
     return "fetch"
@@ -316,7 +322,8 @@ def save_task(task_id: str | None, name: str, url: str, username: str, password:
               keep_alive_url: str = "", keep_alive_time_from: str = "",
               keep_alive_time_to: str = "",
               active: bool = True, schedule_start_date: str = "",
-              schedule_end_date: str = "", keep_alive_mode: str = "fetch") -> str:
+              schedule_end_date: str = "", keep_alive_mode: str = "fetch",
+              run_missed_asap: bool = True) -> str:
     tasks = load_tasks()
     if password:
         encrypted = crypto_utils.protect(password)
@@ -346,6 +353,7 @@ def save_task(task_id: str | None, name: str, url: str, username: str, password:
         "keep_alive_time_from": (keep_alive_time_from or "").strip(),
         "keep_alive_time_to": (keep_alive_time_to or "").strip(),
         "active": active,
+        "run_missed_asap": bool(run_missed_asap),
     }
     for i, t in enumerate(tasks):
         if t["id"] == entry_id:

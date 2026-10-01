@@ -83,11 +83,47 @@ class FakeContext:
     def __init__(self, page):
         self._page = page
         self.saved_to = []
+        self.request = FakeRequest(page)
 
     def storage_state(self, path=None):
         self.saved_to.append(path)
         with open(path, "w", encoding="utf-8") as f:
             f.write("{}")
+
+
+class FakeResponse:
+    def __init__(self, status=200, body=""):
+        self.status = status
+        self._body = body
+
+    def text(self):
+        return self._body
+
+
+LOGIN_PAGE_HTML = (
+    "<html><body><form><input type='password' name='password'>"
+    "</form><a>Iniciar sesión</a></body></html>"
+)
+PANEL_HTML = "<html><body><h1>Panel del curso</h1></body></html>"
+
+
+class FakeRequest:
+    """Doble de page.context.request: GET directo con las cookies del
+    contexto, sin tocar la pestaña visible."""
+
+    def __init__(self, page, fail_times=0):
+        self._page = page
+        self.fail_times = fail_times
+        self.get_calls = []
+
+    def get(self, url, timeout=None, headers=None):
+        self.get_calls.append(url)
+        if self.fail_times > 0:
+            self.fail_times -= 1
+            raise PlaywrightError("red caída")
+        if self._page.serve_login_page:
+            return FakeResponse(200, LOGIN_PAGE_HTML)
+        return FakeResponse(200, PANEL_HTML)
 
 
 class FakeMouse:
@@ -408,3 +444,73 @@ def test_fetch_heartbeat_reports_login_page():
     assert alive is True and "http 200 ok" in detail
     alive, detail = run_login._fetch_heartbeat(FakePage(serve_login_page=True))
     assert alive is False and "login-page" in detail
+
+
+# --- modo request (petición directa): tráfico real sin tocar la pestaña ---
+
+def test_normalize_keep_alive_mode_request():
+    assert run_login.normalize_keep_alive_mode("request") == "request"
+    assert run_login.normalize_keep_alive_mode("REQUEST") == "request"
+    assert run_login.normalize_keep_alive_mode(
+        "Petición directa al servidor (recomendado): mantiene la sesión sin tocar la pestaña"
+    ) == "request"
+    assert run_login.normalize_keep_alive_mode("fetch") == "fetch"
+
+
+def test_request_heartbeat_ok_and_login_page():
+    page = FakePage()
+    alive, detail = run_login._request_heartbeat(page, "https://app.example.com/panel")
+    assert alive is True and "http 200 ok" in detail
+    assert page.context.request.get_calls == ["https://app.example.com/panel"]
+    assert page.goto_calls == [] and page.reload_calls == 0  # pestaña intacta
+
+    page = FakePage(serve_login_page=True)
+    alive, detail = run_login._request_heartbeat(page, "https://app.example.com/panel")
+    assert alive is False and "login-page" in detail
+
+
+def test_request_heartbeat_network_error_is_not_fatal():
+    page = FakePage()
+    page.context.request.fail_times = 99
+    alive, detail = run_login._request_heartbeat(page, "https://app.example.com/panel")
+    assert alive is True and "se vigila por DOM" in detail
+
+
+def test_request_heartbeat_without_request_api_falls_back_to_fetch():
+    page = FakePage()
+    page.context.request = None
+    alive, detail = run_login._request_heartbeat(page, "https://app.example.com/panel")
+    assert alive is True and "http 200 ok" in detail
+    assert any("fetch(" in call for call in page.eval_calls)
+
+
+def test_request_mode_healthy_without_reload_or_goto(monkeypatch):
+    monkeypatch.setattr(run_login, "notify_failure", lambda cfg, msg: None)
+    page = FakePage()
+    stats = run_login.keep_session_alive(
+        page, base_cfg(keep_alive_mode="request"), "input[type='password']",
+        sleeper=noop, clock=FakeClock(), now_fn=lambda: datetime.datetime(2026, 9, 17, 10, 0),
+    )
+    assert stats["end_reason"] == "finished"
+    assert stats["refreshes"] >= 1
+    assert stats["failures"] == 0 and stats["relogins"] == 0
+    assert page.reload_calls == 0  # ninguna recarga: ninguna conexión nueva
+    assert page.goto_calls == []  # ni siquiera navega la pestaña
+    assert len(page.context.request.get_calls) >= 1  # el latido sí toca el servidor
+
+
+def test_request_mode_confirms_once_before_relogin(tmp_path, monkeypatch):
+    monkeypatch.setattr(run_login, "notify_failure", lambda cfg, msg: None)
+    session_file = str(tmp_path / "s.json")
+    page = FakePage(url="https://app.example.com/login", password_visible=True,
+                    cure_on_fill=True, serve_login_page=True)
+    stats = run_login.keep_session_alive(
+        page, base_cfg(keep_alive_mode="request"), "input[type='password']",
+        session_path=session_file,
+        sleeper=noop, clock=FakeClock(), now_fn=lambda: datetime.datetime(2026, 9, 17, 10, 0),
+    )
+    assert stats["relogins"] == 1
+    assert stats["end_reason"] == "finished"
+    assert page.reload_calls == 1  # una única recarga de confirmación
+    assert page.context.saved_to == [session_file]
+    assert page.filled.get("input[type='password']") == "p"

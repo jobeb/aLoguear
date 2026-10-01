@@ -55,7 +55,8 @@ except Exception:
     _tray_toast = None
 
 KEEP_ALIVE_MODES = (
-    ("fetch", "Toque ligero al servidor (recomendado): mantiene la sesión sin recargar"),
+    ("request", "Petición directa al servidor (recomendado): mantiene la sesión sin tocar la pestaña"),
+    ("fetch", "Toque ligero al servidor: mantiene la sesión sin recargar (desde la pestaña)"),
     ("work", "Visitar página de trabajo: navega a la URL de trabajo cada ciclo (más fuerte)"),
     ("light", "Solo actividad local: sin peticiones (solo anti temporizador JS)"),
     ("reload", "Recarga completa: como antes (puede registrar conexiones)"),
@@ -68,6 +69,8 @@ def _normalize_keep_alive_mode_gui(value) -> str:
         return "reload"
     if v == "light" or "solo actividad local" in v:
         return "light"
+    if v == "request" or "petición directa" in v or "peticion directa" in v:
+        return "request"
     if v == "work" or "visitar" in v or "página de trabajo" in v:
         return "work"
     return "fetch"
@@ -412,7 +415,9 @@ class App(tk.Tk):
         self._tray_hint_shown = False
         self._run_now_busy = set()
         self._test_process = None
+        self._test_task_id = None
         self._test_stop_requested = False
+        self._poll_running_after_id = None
 
         _unblock_ps_scripts(_script_dir_global())
 
@@ -523,7 +528,7 @@ class App(tk.Tk):
         search_row.grid_columnconfigure(1, weight=1)
         ttk.Label(search_row, text="🔍", style="Card.TLabel").grid(row=0, column=0, padx=(0, 6))
         self.search_var = tk.StringVar()
-        self.search_var.trace_add("write", lambda *_: self._refresh_task_list())
+        self.search_var.trace_add("write", lambda *_: self._safe_refresh_from_search())
         search_entry = ttk.Entry(
             search_row, textvariable=self.search_var, style="Search.TEntry",
         )
@@ -611,6 +616,7 @@ class App(tk.Tk):
         self.tree.tag_configure("paused_row", foreground=MUTED)
         self.tree.tag_configure("even_row", background=ZEBRA_BG)
         self.tree.tag_configure("ok_row", foreground=SUCCESS)
+        self.tree.tag_configure("running_row", background=SUCCESS_BG)
 
         tree_scroll_x = ttk.Scrollbar(list_card, orient="horizontal", command=self.tree.xview)
         self.tree.configure(xscrollcommand=tree_scroll_x.set)
@@ -622,7 +628,8 @@ class App(tk.Tk):
         ToolTip(
             self.tree,
             "Clic en una tarea para cargarla en el formulario.\n"
-            "Clic en ▶ para ejecutarla al instante.\n"
+            "Clic en ▶ para ejecutarla al instante (⏹ = ya en marcha).\n"
+            "🟢 = hay una ejecución viva (keep-alive o prueba en curso).\n"
             "Clic para elegir una (o Ctrl+clic / Mayús+clic para varias) y usar la barra de lote.",
         )
         # Atajos de la lista: Supr elimina, Ctrl+A selecciona todo, Esc limpia.
@@ -843,6 +850,11 @@ class App(tk.Tk):
         ka_mode_combo.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(4, 0))
         ToolTip(
             ka_mode_combo,
+            "Petición directa: tráfico real al servidor con tus cookies, sin tocar\n"
+            "la pestaña ni ejecutar JS (solo descarga el HTML). Mantiene la sesión\n"
+            "con transferencia mínima y sin generar conexiones nuevas. Recomendado\n"
+            "con intervalo corto (2-5 min) si el sitio cierra sesiones inactivas.\n"
+            "Solo reconecta si la sesión caducó de verdad (doble confirmación).\n\n"
             "Toque ligero: petición mínima al servidor con tus cookies, sin recargar\n"
             "ni navegar. Mantiene la sesión (aunque el sitio mida la inactividad en\n"
             "el servidor) sin generar conexiones nuevas. Solo reconecta si la\n"
@@ -1050,6 +1062,20 @@ class App(tk.Tk):
             style="Muted.TLabel"
         ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
+        self.run_missed_asap_var = tk.BooleanVar(value=True)
+        missed_chk = ttk.Checkbutton(
+            sched, text="Si el equipo estaba apagado, ejecutar en cuanto sea posible",
+            variable=self.run_missed_asap_var, style="Card.TCheckbutton"
+        )
+        missed_chk.grid(row=3, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        ToolTip(
+            missed_chk,
+            "Si a la hora programada el equipo estaba apagado o suspendido, "
+            "Windows la ejecuta en cuanto vuelva a estar disponible.\n"
+            "Equivale a «Ejecutar la tarea lo antes posible después de "
+            "omitirse la programación» del Programador de tareas.",
+        )
+
         # --- Guardar / Probar ---
         action_card = ttk.Labelframe(outer, text="  Acciones  ", style="Card.TLabelframe", padding=16)
         action_card.grid(row=row, column=0, sticky="ew", pady=(0, 14))
@@ -1101,6 +1127,7 @@ class App(tk.Tk):
 
         self._refresh_task_list()
         self._clear_form()
+        self._start_running_poll()
 
         self.update_idletasks()
         # Ventana centrada y con tamaño inicial generoso pero acotado a la pantalla.
@@ -1165,6 +1192,16 @@ class App(tk.Tk):
         # de tareas programadas de Windows son procesos independientes y
         # siguen su curso (su lock anti-solape las protege).
         try:
+            after_id = getattr(self, "_poll_running_after_id", None)
+            if after_id is not None:
+                try:
+                    self.after_cancel(after_id)
+                except Exception:
+                    pass
+                self._poll_running_after_id = None
+        except Exception:
+            pass
+        try:
             proc = getattr(self, "_test_process", None)
             if proc is not None and proc.poll() is None:
                 try:
@@ -1181,6 +1218,7 @@ class App(tk.Tk):
         except Exception:
             pass
         self._test_process = None
+        self._test_task_id = None
         try:
             if getattr(self, "tray_icon", None) is not None:
                 try:
@@ -1324,6 +1362,7 @@ class App(tk.Tk):
             self.tree.tag_configure("paused_row", foreground=MUTED)
             self.tree.tag_configure("even_row", background=ZEBRA_BG)
             self.tree.tag_configure("ok_row", foreground=SUCCESS)
+            self.tree.tag_configure("running_row", background=SUCCESS_BG)
         # Reaplicar el estado visible para que coja los nuevos colores.
         if getattr(self, "status_var", None) is not None and self.status_var.get():
             current_style = str(getattr(self.status_label, "cget", lambda *_: "")("style") or "")
@@ -1796,8 +1835,21 @@ class App(tk.Tk):
 
     # --- Lista de tareas ---
 
+    def _safe_refresh_from_search(self):
+        """Refresco desde el filtro de búsqueda: no hace nada si la lista aún
+        no existe (el trace se dispara durante el __init__, al poner el
+        placeholder, antes de crear el Treeview)."""
+        if self.__dict__.get("tree") is None:
+            return
+        try:
+            self._refresh_task_list()
+        except Exception:
+            pass
+
     def _refresh_task_list(self, select_id: str | None = None,
                            select_ids: list | None = None):
+        if self.__dict__.get("tree") is None:
+            return
         self.tree.delete(*self.tree.get_children())
         all_tasks = config_store.load_tasks()
         query = self.search_var.get().strip().lower() if hasattr(self, "search_var") else ""
@@ -1812,6 +1864,7 @@ class App(tk.Tk):
         for index, task in enumerate(tasks):
             active = task.get("active", True)
             last_result = config_store.load_last_result(task["id"])
+            running = self._is_task_running(task["id"])
             tags = []
             if index % 2 == 1:
                 tags.append("even_row")
@@ -1821,21 +1874,36 @@ class App(tk.Tk):
                 tags.append("ok_row")
             if not active:
                 tags.append("paused_row")
-            status_dot = "⏸ " if not active else ("● " if last_result and not last_result.get("success") else "")
+            if running:
+                tags.append("running_row")
+            if not active:
+                status_dot = "⏸ "
+            elif running:
+                status_dot = "🟢 "
+            else:
+                status_dot = "● " if last_result and not last_result.get("success") else ""
+            if running:
+                state_txt = "🟢 En marcha"
+            else:
+                state_txt = "Pausada" if not active else "Activa"
+            if running:
+                run_txt = "⏹"
+            else:
+                run_txt = "⏳" if task["id"] in self._run_now_busy else "▶"
             self.tree.insert(
                 "", "end", iid=task["id"],
                 text=f"{status_dot}{task.get('name') or task.get('url', '')}",
                 values=(
                     task.get("schedule_time", ""),
                     _days_display(task.get("schedule_days", [])),
-                    "Pausada" if not active else "Activa",
+                    state_txt,
                     _validity_display(
                         task.get("schedule_start_date", ""),
                         task.get("schedule_end_date", ""),
                     ),
                     _last_result_display(last_result),
                     "Pausada" if not active else "…",
-                    "⏳" if task["id"] in self._run_now_busy else "▶",
+                    run_txt,
                 ),
                 tags=tuple(tags),
             )
@@ -1902,6 +1970,139 @@ class App(tk.Tk):
             if not self.tree.exists(task_id):
                 continue
             self.tree.set(task_id, "next", _format_net_date(next_runs.get(task_id)))
+
+    # --- Estado "en marcha" (ejecución viva) ---
+
+    def _is_task_running(self, task_id: str) -> bool:
+        """True si hay una ejecución viva de `task_id`: prueba con keep-alive
+        lanzada desde esta GUI, 'Ejecutar' en curso, o runner programado con
+        keep-alive (detectado por el lock anti-solape)."""
+        try:
+            if task_id in getattr(self, "_run_now_busy", set()):
+                return True
+        except Exception:
+            pass
+        try:
+            proc = getattr(self, "_test_process", None)
+            if (proc is not None and proc.poll() is None
+                    and getattr(self, "_test_task_id", None) == task_id):
+                return True
+        except Exception:
+            pass
+        try:
+            return self._live_runner_pid(task_id) is not None
+        except Exception:
+            return False
+
+    def _refresh_running_indicators(self) -> bool:
+        """Actualiza solo las marcas de 'en marcha' sin reconstruir la lista
+        (conserva selección, orden y scroll). Devuelve True si algo cambió."""
+        changed = False
+        try:
+            children = list(self.tree.get_children(""))
+        except Exception:
+            return False
+        # Mapa activo/pausada sin descifrar contraseñas (get_task usa DPAPI:
+        # caro para hacerlo por tarea cada 5 s).
+        try:
+            active_map = {
+                t.get("id"): t.get("active", True)
+                for t in config_store.load_tasks() if isinstance(t, dict)
+            }
+            total = len(active_map)
+        except Exception:
+            active_map, total = {}, 0
+        running_count = 0
+        for iid in children:
+            try:
+                running = self._is_task_running(iid)
+            except Exception:
+                continue
+            if running:
+                running_count += 1
+            try:
+                cur_run = self.tree.set(iid, "run")
+                cur_state = self.tree.set(iid, "state")
+            except Exception:
+                continue
+            want_run = "⏹" if running else ("⏳" if iid in self._run_now_busy else "▶")
+            want_state = "🟢 En marcha" if running else None
+            if want_state is None:
+                # No pisar "Pausada"; solo restaurar Activa si habíamos puesto En marcha.
+                active = active_map.get(iid, True)
+                want_state = "Pausada" if not active else "Activa"
+            if cur_run != want_run:
+                try:
+                    self.tree.set(iid, "run", want_run)
+                except Exception:
+                    pass
+                changed = True
+            if cur_state != want_state:
+                try:
+                    self.tree.set(iid, "state", want_state)
+                except Exception:
+                    pass
+                changed = True
+            try:
+                text = self.tree.item(iid, "text") or ""
+                if running:
+                    base = text[2:] if text.startswith("🟢 ") else text
+                    want_text = f"🟢 {base}"
+                    if want_text != text:
+                        self.tree.item(iid, text=want_text)
+                        changed = True
+                elif text.startswith("🟢 "):
+                    # Terminó: quitar el prefijo; el resto de marcas (⏸/●)
+                    # las repone el refresco completo al terminar la ejecución.
+                    self.tree.item(iid, text=text[2:])
+                    changed = True
+            except Exception:
+                pass
+            try:
+                tags = list(self.tree.item(iid, "tags") or [])
+                if running and "running_row" not in tags:
+                    tags.append("running_row")
+                    self.tree.item(iid, tags=tuple(tags))
+                    changed = True
+                elif not running and "running_row" in tags:
+                    tags.remove("running_row")
+                    self.tree.item(iid, tags=tuple(tags))
+                    changed = True
+            except Exception:
+                pass
+        try:
+            if total and running_count and hasattr(self, "list_count_var"):
+                txt = self.list_count_var.get()
+                suffix = f"  ·  🟢 {running_count} en marcha"
+                if suffix not in txt:
+                    base = txt.split("  ·  🟢")[0]
+                    self.list_count_var.set(base + suffix)
+            elif hasattr(self, "list_count_var"):
+                txt = self.list_count_var.get()
+                if "  ·  🟢" in txt:
+                    self.list_count_var.set(txt.split("  ·  🟢")[0])
+        except Exception:
+            pass
+        return changed
+
+    def _poll_running_state(self):
+        """Revisa cada pocos segundos si cambió el estado en marcha (los
+        runners programados son procesos externos: solo se ven por su lock)."""
+        try:
+            self._refresh_running_indicators()
+        except Exception:
+            pass
+        try:
+            self._poll_running_after_id = self.after(5000, self._poll_running_state)
+        except Exception:
+            pass
+
+    def _start_running_poll(self):
+        try:
+            if getattr(self, "_poll_running_after_id", None) is None:
+                self._poll_running_after_id = self.after(5000, self._poll_running_state)
+        except Exception:
+            pass
 
     def _sort_tree(self, col: str):
         reverse = self._sort_column == col and not self._sort_reverse
@@ -2082,6 +2283,7 @@ class App(tk.Tk):
                     schedule_days=_normalize_schedule_days(entry.get("schedule_days")),
                     schedule_start_date=_normalize_iso_date(str(entry.get("schedule_start_date", ""))),
                     schedule_end_date=_normalize_iso_date(str(entry.get("schedule_end_date", ""))),
+                    run_missed_asap=bool(entry.get("run_missed_asap", True)),
                     keep_alive=bool(entry.get("keep_alive", False)),
                     keep_alive_interval_min=_parse_int_safe(
                         entry.get("keep_alive_interval_min", 5), 5, 1, 120
@@ -2163,6 +2365,7 @@ class App(tk.Tk):
             keep_alive_time_from=data.get("keep_alive_time_from", ""),
             keep_alive_time_to=data.get("keep_alive_time_to", ""),
             keep_alive_mode=data.get("keep_alive_mode", "fetch"),
+            run_missed_asap=data.get("run_missed_asap", True),
             active=active,
         )
         return True
@@ -2180,6 +2383,7 @@ class App(tk.Tk):
                 "-TaskId", task_id,
                 "-Time", data.get("schedule_time", "08:00"),
                 "-Days", ",".join(data.get("schedule_days") or []),
+                "-StartWhenAvailable", "True" if data.get("run_missed_asap", True) else "False",
             ]
             if data.get("schedule_start_date"):
                 args += ["-StartDate", data["schedule_start_date"]]
@@ -2560,6 +2764,7 @@ class App(tk.Tk):
             var.set(True)
         self.start_date_var.set("")
         self.end_date_var.set("")
+        self.run_missed_asap_var.set(True)
         self._set_status("", "")
         self.mode_label.configure(text="＋  Nueva tarea")
         self.mode_badge.configure(text="SIN GUARDAR")
@@ -2620,6 +2825,7 @@ class App(tk.Tk):
 
         self.start_date_var.set(_normalize_iso_date(data.get("schedule_start_date", "")))
         self.end_date_var.set(_normalize_iso_date(data.get("schedule_end_date", "")))
+        self.run_missed_asap_var.set(data.get("run_missed_asap", True))
 
         self._set_status("", "")
         short_name = (data.get('name') or data.get('url', ''))[:40]
@@ -2744,6 +2950,7 @@ class App(tk.Tk):
                 schedule_days=self._selected_days(),
                 schedule_start_date=_normalize_iso_date(self.start_date_var.get()),
                 schedule_end_date=_normalize_iso_date(self.end_date_var.get()),
+                run_missed_asap=self.run_missed_asap_var.get(),
                 keep_alive=self.keep_alive_var.get(),
                 keep_alive_interval_min=interval_min,
                 keep_alive_duration_min=duration_min,
@@ -2773,16 +2980,19 @@ class App(tk.Tk):
                 self.current_task_id, active, self._schedule_time_str(), self._selected_days(),
                 _normalize_iso_date(self.start_date_var.get()),
                 _normalize_iso_date(self.end_date_var.get()),
+                self.run_missed_asap_var.get(),
             ),
             daemon=True,
         ).start()
 
     def _save_and_sync_schedule_thread(self, task_id: str, active: bool, time_str: str, days: list,
-                                       start_date: str = "", end_date: str = ""):
+                                       start_date: str = "", end_date: str = "",
+                                       run_missed_asap: bool = True):
         script_dir = _script_dir_global()
         if active:
             ps_script = os.path.join(script_dir, "register_task.ps1")
-            args = ["-TaskId", task_id, "-Time", time_str, "-Days", ",".join(days)]
+            args = ["-TaskId", task_id, "-Time", time_str, "-Days", ",".join(days),
+                    "-StartWhenAvailable", "True" if run_missed_asap else "False"]
             if start_date:
                 args += ["-StartDate", start_date]
             if end_date:
@@ -2839,15 +3049,26 @@ class App(tk.Tk):
     def _run_test(self, task_id: str):
         # Prueba REAL: sin --no-keep-alive, para que si la tarea tiene
         # "mantener sesión activa" se quede viva igual que la programada.
+        # Sin consola propia: el runner ya escribe en logs/<id>.log; heredar
+        # la consola de la GUI solo ensuciaba su ventana (y hacía parpadear
+        # otra al lanzar desde pythonw).
         cmd = _runner_command(task_id)
         config_store.write_app_log(f"Probar ahora tarea {task_id}: lanzando runner con keep-alive...")
+        popen_kwargs: dict = {
+            "cwd": _runner_cwd(),
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.STDOUT,
+        }
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         try:
-            proc = subprocess.Popen(cmd, cwd=_runner_cwd())
+            proc = subprocess.Popen(cmd, **popen_kwargs)
         except Exception as exc:
             self.after(0, lambda: self._test_done(
                 False, f"✗ No se pudo lanzar la prueba: {exc}"))
             return
         self._test_process = proc
+        self._test_task_id = task_id
         self.after(0, lambda: self._test_started(task_id))
         try:
             returncode = proc.wait()
@@ -2857,6 +3078,7 @@ class App(tk.Tk):
         if getattr(self, "_test_stop_requested", False):
             return
         self._test_process = None
+        self._test_task_id = None
         ok = returncode == 0
         config_store.write_app_log(f"Probar ahora tarea {task_id}: exit={returncode}")
         if ok:
@@ -2879,6 +3101,10 @@ class App(tk.Tk):
             "Mira el progreso en 📄 y pulsa Detener para pararla.",
         )
         self._refresh_log_button()
+        try:
+            self._refresh_running_indicators()
+        except Exception:
+            pass
 
     def _stop_test_process(self):
         proc = getattr(self, "_test_process", None)
@@ -2898,6 +3124,7 @@ class App(tk.Tk):
             except Exception:
                 pass
         self._test_process = None
+        self._test_task_id = None
         try:
             self.test_btn.configure(text="▶  Probar ahora", state="normal")
         except Exception:
@@ -2912,6 +3139,7 @@ class App(tk.Tk):
 
     def _test_done(self, ok: bool, message: str):
         self._test_process = None
+        self._test_task_id = None
         try:
             self.test_btn.configure(text="▶  Probar ahora", state="normal")
         except Exception:
@@ -2933,7 +3161,7 @@ class App(tk.Tk):
             return "#99"
 
     def _on_tree_click_run(self, event=None):
-        """Clic en la celda ▶ de una fila: ejecuta esa tarea al instante."""
+        """Clic en la celda ▶/⏹ de una fila: ejecuta, o avisa si ya está en marcha."""
         try:
             row = self.tree.identify_row(event.y)
             col = self.tree.identify_column(event.x)
@@ -2942,6 +3170,16 @@ class App(tk.Tk):
         if not row or col != self._run_column_id():
             return None
         self.tree.selection_set(row)
+        if self._is_task_running(row):
+            pid = self._live_runner_pid(row)
+            extra = f" (PID {pid})" if pid else ""
+            messagebox.showinfo(
+                "Ya en marcha",
+                f"Esa tarea ya tiene una ejecución viva{extra} "
+                "(keep-alive o prueba en curso).\n"
+                "Espera a que termine o detenla (⏹ Probar ahora / pausar la tarea).",
+            )
+            return "break"
         self.on_run_task_now(row)
         return "break"
 
@@ -2969,14 +3207,31 @@ class App(tk.Tk):
         if task_id in self._run_now_busy:
             messagebox.showinfo("Ya en curso", "Esa tarea ya se está ejecutando; espera a que termine.")
             return
+        if self._is_task_running(task_id):
+            pid = self._live_runner_pid(task_id)
+            extra = f" (PID {pid})" if pid else ""
+            messagebox.showinfo(
+                "Ya en marcha",
+                f"«{name}» ya tiene una ejecución viva{extra} "
+                "(keep-alive o prueba en curso).\n"
+                "Espera a que termine o detenla antes de lanzarla de nuevo.",
+            )
+            try:
+                self._refresh_running_indicators()
+            except Exception:
+                pass
+            return
         task = config_store.get_task(task_id)
         name = (task.get("name") or task.get("url", task_id)) if task else task_id
         if not task:
             messagebox.showerror("No se puede ejecutar", f"La tarea '{task_id}' ya no existe.")
             return
         self._run_now_busy.add(task_id)
-        if self.tree.exists(task_id):
-            self.tree.set(task_id, "run", "⏳")
+        try:
+            self._refresh_running_indicators()
+        except Exception:
+            if self.tree.exists(task_id):
+                self.tree.set(task_id, "run", "⏳")
         self._set_status("info", f"Ejecutando «{name}»… esto puede tardar unos segundos.")
         self.run_now_btn.configure(state="disabled")
         threading.Thread(target=self._run_task_now_thread, args=(task_id, name), daemon=True).start()
